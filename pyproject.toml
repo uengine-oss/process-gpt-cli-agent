@@ -1,0 +1,45 @@
+# This is an application, not a distributable package: it is run, not imported.
+# The metadata below exists for tooling (ruff, pytest) and to declare what the
+# container needs; install with `pip install -r requirements.txt`.
+[project]
+name = "process-gpt-cli-agent"
+version = "0.1.0"
+description = "ProcessGPT agent type that delegates work items to CLI coding agents (Claude Code, Codex)."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "uEngine" }]
+
+dependencies = [
+    # The strategy layer for "which CLI agent, and how do I talk to it".
+    # Pulled from git rather than PyPI because the exec surface this service
+    # depends on lives there; pin to a tag before a production rollout.
+    "cliagents @ git+https://github.com/uengine-oss/cliagents@main",
+    "process-gpt-agent-sdk[sse]==0.4.23",
+    "a2a-sdk==1.1.0",
+    "protobuf==6.33.6",
+    "starlette==1.2.1",
+    "uvicorn==0.49.0",
+    "python-dotenv==1.2.2",
+    "python-multipart>=0.0.9",
+    "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0.0", "pytest-asyncio>=0.24", "ruff>=0.7.0"]
+
+[project.urls]
+Homepage = "https://github.com/uengine-oss/process-gpt-cli-agent"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+pythonpath = ["."]

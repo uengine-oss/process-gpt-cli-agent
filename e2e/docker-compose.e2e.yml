@@ -1,0 +1,19 @@
+# Infrastructure only. The service under test runs from the working tree, so a
+# code change is exercised without a rebuild.
+services:
+  db:
+    image: supabase/postgres:15.8.1.060
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: processgpt
+    ports:
+      - "54329:5432"
+    volumes:
+      # Point this at the ProcessGPT schema from the parent repository:
+      #   ../../../docker-infra/volumes/db/init.sql
+      - ./seed:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d processgpt"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
