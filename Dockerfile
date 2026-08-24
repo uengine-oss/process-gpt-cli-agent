@@ -1,5 +1,5 @@
-# Build context is the ProcessGPT monorepo root (same as the sibling services):
-#   docker build -f services/cli-agent/Dockerfile -t process-gpt-cli-agent .
+# Build from this directory:
+#   docker build -t ghcr.io/uengine-oss/process-gpt-cli-agent:latest .
 FROM python:3.13-slim
 
 ENV TZ=Asia/Seoul
@@ -23,14 +23,14 @@ WORKDIR /app
 ENV PYTHONPATH=/app
 ENV PIP_DEFAULT_TIMEOUT=300
 
-COPY services/cli-agent/requirements.txt ./
+COPY requirements.txt ./
 RUN pip install --no-cache-dir --upgrade pip && pip install --no-cache-dir -r requirements.txt
 
-COPY services/cli-agent/. .
+COPY . .
 
 # Bundled system skills, so an air-gapped deployment has the same skills as a
 # connected one. Seeded into SKILLS_DIRS at startup.
-COPY skills /app/system-skills
+COPY system-skills /app/system-skills
 
 # Workspaces must outlive the process: a run paused for a human resumes into its
 # own directory, and a download reads from it after the run has exited.

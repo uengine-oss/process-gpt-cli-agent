@@ -34,6 +34,12 @@ Homepage = "https://github.com/uengine-oss/process-gpt-cli-agent"
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+# Bundled skills are vendored content, kept byte-identical to the copy the
+# other orchestrations ship so a fix travels to both. Reformatting them here
+# would make that comparison useless.
+# `skills/` is runtime state: the seeded copy of the above plus whatever
+# tenants uploaded. Neither is this project's source.
+exclude = ["system-skills", "skills"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "W"]

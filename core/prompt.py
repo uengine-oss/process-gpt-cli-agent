@@ -13,11 +13,53 @@ fields has done the job wrong in a way no exception reports.
 from __future__ import annotations
 
 import json
+import uuid
 from typing import Any
 
 #: Enough of a large input to be useful, little enough to leave room for the
 #: work. Inputs past this are written to the workspace instead and referenced.
 _INLINE_INPUT_LIMIT = 8_000
+
+#: Where a skill's generated process artifacts go inside the run's workspace.
+#: The name is the one the process generation skill documents for a CLI run.
+ARTIFACT_SUBDIR = ".bpmn"
+
+
+def process_dir_name(run_id: str) -> str:
+    """The folder a generated process definition belongs in.
+
+    Derived from the run rather than drawn at random, so a retry or a resumed
+    run writes into the first attempt's folder instead of leaving a rival one
+    beside it — and derived the way the deepagents orchestration derives it, so
+    the same id names the same folder whichever engine produced the artifacts.
+    """
+    return f"process-{uuid.uuid5(uuid.NAMESPACE_URL, run_id or 'processgpt').hex[:7]}"
+
+
+def artifact_paths(workdir: str, run_id: str) -> str:
+    """The one thing a process generation skill cannot know by itself.
+
+    The skill documents what its output files are *called*; the base directory
+    and the process folder are per-run values only the service holds. Left
+    unsaid, the agent picks both — and a definition written to a name nobody
+    looks for is indistinguishable from one that was never written.
+    """
+    base = f"{workdir.rstrip('/' + chr(92))}/{ARTIFACT_SUBDIR}"
+    folder = process_dir_name(run_id)
+    return "\n".join(
+        [
+            "## 📁 이번 실행 전용 산출물 경로(필수)",
+            "프로세스·스킬을 생성하는 스킬이 말하는 '산출물 기준 디렉터리'가 이것입니다.",
+            f"기준 디렉터리는 `{base}/` 입니다.",
+            f"- 프로세스를 만들면 `{base}/{folder}/` 안에 `process-definition.json` ·",
+            "  `forms/<activity_id>.form` · `skills/<safe-name>/SKILL.md` ·",
+            "  `agents/<agent_id>.json`(에이전트 1명 = 파일 1개) · `manifest.json` 을 둡니다.",
+            f"- 프로세스가 여럿이면 두 번째부터 `{folder}-2`, `{folder}-3` 처럼 뒤에 번호만 붙입니다.",
+            f"- 프로세스가 아니라 스킬만 만드는 경우에는 `{base}/skills/<safe-name>/SKILL.md` 에 바로 만듭니다.",
+            "- 폴더명에 `<`, `>` 나 '랜덤'·'id' 같은 placeholder 단어를 쓰지 마세요.",
+            f"- 스킬 문서가 `/workspace/{ARTIFACT_SUBDIR}/...` 라고 적어 두었더라도 위 경로로 바꿔 씁니다.",
+        ]
+    )
 
 
 def build(row: dict[str, Any], extras: dict[str, Any], *, workdir: str) -> str:

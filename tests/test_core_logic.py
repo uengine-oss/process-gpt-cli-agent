@@ -314,3 +314,108 @@ def test_a_run_that_reached_outside_reports_itself_as_partial(tmp_path):
     log.note_out_of_scope("워크스페이스 밖 경로 수정")
     assert not log.replayable
     assert log.limitations() == ["워크스페이스 밖 경로 수정"]
+
+
+# --- activity settings ----------------------------------------------------
+
+
+def test_an_activitys_skills_and_cli_come_from_the_process_definition():
+    """`todolist` has no column for either — a service that reads only the row
+    ignores every choice made on the designer screen and quietly uses defaults."""
+    from core import activity
+
+    definition = {
+        "activities": [
+            {"id": "other", "skills": ["nope"]},
+            {
+                "id": "review",
+                "skills": ["hwpx-writer", "expense-policy"],
+                "agentConfig": {"agent_cli": "codex", "model": "gpt-5"},
+            },
+        ]
+    }
+
+    declared = activity.extract(definition, "review")
+    assert declared.skills == ["hwpx-writer", "expense-policy"]
+    assert declared.agent_config["agent_cli"] == "codex"
+
+
+def test_a_freshly_generated_definition_is_read_too():
+    """The generation skill writes `elements`; the engine stores `activities`.
+    Reading only one leaves the other silently without skills."""
+    from core import activity
+
+    declared = activity.extract(
+        {"elements": [{"id": "apply", "skills": "a, b"}]}, "apply"
+    )
+    assert declared.skills == ["a", "b"]
+
+
+def test_an_unknown_activity_declares_nothing_rather_than_guessing():
+    from core import activity
+
+    assert activity.extract({"activities": [{"id": "x"}]}, "y") == activity.Capabilities()
+    assert activity.extract(None, "x") == activity.Capabilities()
+
+
+# --- permission refusals --------------------------------------------------
+
+
+def test_the_run_instructions_keep_the_agent_inside_its_workspace():
+    """The agent went looking for a skill in the machine's home directory, was
+    refused (outside the workspace), and stopped — with the same skill already
+    provisioned into the project."""
+    from pathlib import Path
+
+    import executor
+    from core.workspace import Workspace
+
+    text = executor._instructions({}, {}, Workspace(path=Path("/ws/run-1"), run_id="run-1"))
+
+    assert "작업 디렉터리 밖의 파일을 읽거나 수정하지 마세요" in text
+    assert ".claude" in text
+
+
+def test_a_run_announces_itself_so_the_monitor_has_a_card():
+    """The panel builds its timeline from `task_started` and applies
+    `task_completed` only to a job it already knows. Without the announcement
+    the result is stored and the screen still says the job is queued."""
+    import asyncio
+    import json as _json
+
+    from a2a.helpers import get_message_text
+    from a2a.types import TaskStatusUpdateEvent
+    from google.protobuf.json_format import MessageToDict
+
+    from executor import CliAgentExecutor
+
+    class _Queue:
+        def __init__(self):
+            self.events = []
+
+        async def enqueue_event(self, event):
+            self.events.append(event)
+
+    class _Provider:
+        display_name = "Claude Code"
+
+    queue = _Queue()
+    asyncio.run(
+        CliAgentExecutor()._started(
+            queue,
+            task_id="t",
+            context_id="c",
+            row={"activity_name": "담당 부서 배정", "query": "민원을 분류하세요"},
+            provider=_Provider(),
+        )
+    )
+
+    assert len(queue.events) == 1
+    event = queue.events[0]
+    assert isinstance(event, TaskStatusUpdateEvent)
+    metadata = MessageToDict(event.metadata, preserving_proto_field_name=True)
+    assert metadata["event_type"] == "task_started"
+    # The card's headline and body come from here.
+    body = _json.loads(get_message_text(event.status.message))
+    assert body["goal"] == "담당 부서 배정"
+    assert body["name"] == "Claude Code"

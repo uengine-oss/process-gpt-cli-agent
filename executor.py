@@ -14,6 +14,7 @@ the form wanted fields fails instead of storing a shrug.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from typing import Any
@@ -27,7 +28,7 @@ from google.protobuf.json_format import ParseDict
 from processgpt_agent_sdk import emit_chunk_json, is_chat_request
 from typing_extensions import override
 
-from core import bridge, hitl, skills
+from core import activity, bridge, hitl, skills
 from core import events as ui_events
 from core import prompt as prompt_builder
 from core.journal import Journal
@@ -105,16 +106,30 @@ class CliAgentExecutor(AgentExecutor):
         workspace: Workspace,
         chat: bool,
     ) -> None:
-        selection = resolve({**row, **extras})
+        # The designer's choices for this activity — which CLI, which skills —
+        # live in the process definition, not on the work item row. Read once,
+        # and treat them as defaults the row may override: a value put on the
+        # item deliberately should beat one inherited from the definition.
+        declared = await asyncio.to_thread(activity.for_work_item, row)
+
+        selection = resolve({"agent_config": declared.agent_config, **row, **extras})
         provider = require_runnable(selection)
+
+        await self._started(
+            event_queue,
+            task_id=task_id,
+            context_id=context_id,
+            row=row,
+            provider=provider,
+        )
 
         journal = Journal(workspace.path)
         journal.capture_baseline(workspace.path)
 
         # --- what the agent can read -----------------------------------
         bundle, skill_failures = skills.build_bundle(
-            instructions=_instructions(row, extras),
-            skill_names=_named_skills(row, extras),
+            instructions=_instructions(row, extras, workspace),
+            skill_names=_named_skills(row, extras) or declared.skills,
             git_skills=_git_skills(row, extras),
         )
         provisioned = skills.provision(provider, bundle, workspace.path, skill_failures)
@@ -188,7 +203,9 @@ class CliAgentExecutor(AgentExecutor):
         # left hanging until its own timeout.
         stream_registry.finish(workspace.run_id)
 
-        if paused is not None:
+        if paused is not None and not final_text:
+            # A refusal with nothing to show is a real block: the agent could
+            # not get past it, so a person has to decide.
             await self._pause(
                 context=context,
                 event_queue=event_queue,
@@ -200,6 +217,20 @@ class CliAgentExecutor(AgentExecutor):
                 question=paused,
             )
             return
+
+        if paused is not None:
+            # A refusal *and* an answer means the agent tried something it was
+            # not allowed, then worked around it. Parking the item here would
+            # discard finished work and wait for a decision nobody needs to
+            # make — but the refusal is still worth saying out loud, because it
+            # is why the answer may be thinner than it should be.
+            await self._notice(
+                context,
+                event_queue,
+                task_id=task_id,
+                context_id=context_id,
+                text=f"실행 중 허용되지 않은 동작이 있었습니다(결과는 그대로 저장합니다): {paused}",
+            )
 
         # --- store ------------------------------------------------------
         outcome = interpret(final_text, extras.get("form_fields"))
@@ -223,9 +254,6 @@ class CliAgentExecutor(AgentExecutor):
             outcome=outcome,
             session_id=session_id,
             journal=journal,
-            # A chat turn has no draft state to park in — the answer is the
-            # answer — so it always closes.
-            complete_mode=chat or _is_complete_mode(row),
         )
 
     async def _stream(
@@ -288,6 +316,42 @@ class CliAgentExecutor(AgentExecutor):
 
     # -- outcomes --------------------------------------------------------
 
+    async def _started(
+        self,
+        event_queue: EventQueue,
+        *,
+        task_id: str,
+        context_id: str,
+        row: dict[str, Any],
+        provider,
+    ) -> None:
+        """Announce the run, so the monitor has a card to fill in later.
+
+        The work-item panel builds its timeline from `task_started` and applies
+        `task_completed` only to a job it already knows about. Skip this and the
+        finished result is stored correctly while the screen still says the job
+        is queued — a run that worked, reported as one that never began.
+        """
+        await self._status(
+            event_queue,
+            task_id=task_id,
+            context_id=context_id,
+            state=TaskState.TASK_STATE_SUBMITTED,
+            text=json.dumps(
+                {
+                    "goal": (row.get("activity_name") or "").strip() or "업무 수행",
+                    "name": provider.display_name,
+                    "role": "CLI 코딩 에이전트",
+                    "task_description": (row.get("query") or "").strip(),
+                },
+                ensure_ascii=False,
+            ),
+            event_type="task_started",
+            # Matches the completion event, so the card renders the answer text
+            # rather than a raw payload dump.
+            crew_type="result",
+        )
+
     async def _complete(
         self,
         *,
@@ -298,7 +362,6 @@ class CliAgentExecutor(AgentExecutor):
         outcome,
         session_id: str | None,
         journal: Journal,
-        complete_mode: bool,
     ) -> None:
         payload = dict(outcome.payload)
         if session_id:
@@ -319,16 +382,16 @@ class CliAgentExecutor(AgentExecutor):
             crew_type="result",
         )
 
-        # `last_chunk` is what the platform reads as "this work item is
-        # finished": it decides whether the result is stored as the item's
-        # output or as a draft awaiting review. Draft mode is not a lesser
-        # completion — it is the run declining to close the item itself.
+        # `last_chunk` means "the run is over", not "the item is closed". The
+        # platform decides output-vs-draft from the item's own `agent_mode`;
+        # sending False here only tells it the run is still going, so a draft
+        # run stays IN_PROGRESS forever with a finished answer sitting in it.
         artifact = new_text_artifact_update_event(
             task_id=task_id,
             context_id=context_id,
             name="assistant_response",
             text=body if outcome.outputs else outcome.raw_text,
-            last_chunk=complete_mode,
+            last_chunk=True,
         )
         ParseDict({"role": "assistant"}, artifact.metadata)
         await event_queue.enqueue_event(artifact)
@@ -448,13 +511,18 @@ class CliAgentExecutor(AgentExecutor):
 # --- reading the work item ------------------------------------------------
 
 
-def _instructions(row: dict[str, Any], extras: dict[str, Any]) -> str:
+def _instructions(row: dict[str, Any], extras: dict[str, Any], workspace: Workspace) -> str:
     """The always-on project instruction file for this run."""
     lines = [
         "# ProcessGPT 업무 에이전트",
         "",
         "당신은 ProcessGPT 업무 프로세스 안에서 실행되는 에이전트입니다.",
-        "- 작업 디렉터리 밖의 파일을 수정하지 마세요.",
+        "- 작업 디렉터리 밖의 파일을 읽거나 수정하지 마세요.",
+        # Without this the agent goes looking for a skill in the machine's home
+        # directory, gets refused (that path is outside the workspace), and
+        # stops — with a copy of the same skill sitting in the project.
+        "- 이 업무에 필요한 스킬과 참고 문서는 모두 작업 디렉터리 안에 이미 제공되어 있습니다. "
+        "홈 디렉터리(`~/.claude` 등)를 찾아보지 마세요.",
         "- 확실하지 않은 값을 지어내지 말고, 모르면 모른다고 결과에 적으세요.",
         "- 연결된 MCP 도구가 있으면 추측 대신 도구로 확인하세요.",
     ]
@@ -464,6 +532,11 @@ def _instructions(row: dict[str, Any], extras: dict[str, Any]) -> str:
     tenant = (row.get("tenant_id") or "").strip()
     if tenant:
         lines += [f"테넌트: {tenant}"]
+
+    # A skill that generates process artifacts documents their file names but
+    # not where this run's files belong — that is a per-run value only the
+    # service holds. Said once here rather than repeated in every skill.
+    lines += ["", prompt_builder.artifact_paths(str(workspace.path), workspace.run_id)]
     return "\n".join(lines)
 
 
@@ -518,12 +591,3 @@ def _session_of(row: dict[str, Any], extras: dict[str, Any]) -> str | None:
     return None
 
 
-def _is_complete_mode(row: dict[str, Any]) -> bool:
-    """Whether this run may close the work item itself.
-
-    Draft is the safer reading of an ambiguous value: a result parked for
-    review can still be approved, while an item closed by mistake has already
-    advanced the process.
-    """
-    mode = str(row.get("agent_mode") or row.get("agentMode") or "").strip().lower()
-    return mode == "complete"

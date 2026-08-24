@@ -47,11 +47,13 @@ someone adds Gemini. The library already treats "which agent" as data.
 
 ## Deploying
 
-Build from the **repo root** — the image needs the library and the bundled
-skills next to the service:
+Build from the service directory:
 
 ```bash
-docker build -f services/cli-agent/Dockerfile -t process-gpt-cli-agent .
+IMAGE_TAG=$(git rev-parse HEAD)
+IMAGE_NAME=ghcr.io/uengine-oss/process-gpt-cli-agent:${IMAGE_TAG}
+docker build -t ${IMAGE_NAME} .
+docker push ${IMAGE_NAME}
 ```
 
 ### Credentials

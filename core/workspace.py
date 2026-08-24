@@ -64,10 +64,16 @@ class Workspace:
         return candidate
 
     def relative(self, path: str | Path) -> str:
+        """The path as the browser should see it: relative, forward slashes.
+
+        The separator is not cosmetic. This value crosses to a file panel that
+        splits on ``/`` to build its folder tree, so a Windows host would send
+        one long filename where a deployment on Linux sends a tree.
+        """
         try:
-            return str(Path(path).resolve().relative_to(self.path.resolve()))
+            return Path(path).resolve().relative_to(self.path.resolve()).as_posix()
         except (ValueError, OSError):
-            return str(path)
+            return Path(path).as_posix()
 
     def files(self) -> list[Path]:
         if not self.exists:

@@ -10,3 +10,6 @@ build/
 .DS_Store
 .env
 workspace/
+# Runtime skill library: bundled skills are seeded here at startup and
+# tenants upload into it. The source of truth is system-skills/.
+skills/

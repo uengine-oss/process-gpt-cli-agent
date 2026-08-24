@@ -32,6 +32,14 @@ logger = logging.getLogger(__name__)
 #: material travelling with it.
 _SKILL_ENTRY_NAMES = ("SKILL.md", "skill.md", "README.md")
 
+#: Files that travel with a skill. Text only — the sink writes strings, and a
+#: skill that needs a binary asset needs a different transport than this one.
+_COMPANION_SUFFIXES = (".md", ".txt", ".json", ".yaml", ".yml", ".csv", ".py", ".sh")
+
+#: Build leftovers that are not part of the skill. Copying compiled bytecode
+#: from another interpreter is at best noise and at worst a stale import.
+_COMPANION_EXCLUDED_DIRS = frozenset({"__pycache__", ".git"})
+
 _GIT_TIMEOUT_SECONDS = 60
 
 
@@ -75,7 +83,8 @@ def build_bundle(
         bundle.add_constitution(instructions)
 
     wanted = set(skill_names or [])
-    for name, folder in _discover_local_skills().items():
+    available = _discover_local_skills()
+    for name, folder in available.items():
         # An empty selection means "everything available" — a work item that
         # named no skills should still get the system ones.
         if wanted and name not in wanted:
@@ -84,6 +93,12 @@ def build_bundle(
             _add_skill_from_folder(bundle, name, folder)
         except OSError as exc:
             failures[name] = f"읽을 수 없음: {exc}"
+
+    # A skill chosen in the designer but absent from this deployment's library
+    # is the failure that looks like nothing: the run proceeds, the agent never
+    # sees it, and the only symptom is a worse answer. Name it.
+    for name in sorted(wanted - set(available) - set(git_skills or {})):
+        failures[name] = "이 서버의 스킬 목록에 없습니다"
 
     for name, repo in (git_skills or {}).items():
         try:
@@ -109,17 +124,36 @@ def provision(provider, bundle: ArtifactBundle, workdir: Path, failures: dict[st
 
 
 def _discover_local_skills() -> dict[str, Path]:
-    """Skill folders on disk, later directories overriding earlier names."""
+    """Skill folders on disk, later directories overriding earlier names.
+
+    Two shapes are accepted because both are written: bundled skills sit
+    directly under their root, while uploaded ones are namespaced by tenant so
+    one tenant cannot shadow another's name — and :func:`seed_system_skills`
+    copies the bundled set under a ``process-gpt-system`` namespace of its own.
+
+    Scanning only the top level finds the *namespace* folder, looks for a
+    SKILL.md one level above where it lives, and returns nothing. That failure
+    is silent: an uploaded skill that never reaches a run looks exactly like an
+    agent that ignored it.
+    """
     found: dict[str, Path] = {}
     roots = [settings.system_skills_dir, *settings.skills_dirs]
     for root in roots:
         if not root.is_dir():
             continue
         for child in sorted(root.iterdir()):
-            if child.is_dir() and _skill_entry(child):
+            if child.is_file():
+                if child.suffix.lower() == ".md":
+                    found[child.stem] = child
+                continue
+            if _skill_entry(child):
                 found[child.name] = child
-            elif child.is_file() and child.suffix.lower() == ".md":
-                found[child.stem] = child
+                continue
+            # A namespace folder: one more level, and no further. Recursing
+            # would start collecting a skill's own subfolders as skills.
+            for grandchild in sorted(child.iterdir()):
+                if grandchild.is_dir() and _skill_entry(grandchild):
+                    found[grandchild.name] = grandchild
     return found
 
 
@@ -142,11 +176,15 @@ def _add_skill_from_folder(bundle: ArtifactBundle, name: str, source: Path) -> N
 
     # Reference material travels with the skill: a body that says "see
     # references/parsing.md" is worse than useless if that file stayed behind.
+    # Scripts count as reference material for the same reason — a skill that
+    # tells the agent to run `scripts/validate.py` needs the script there.
     companions: dict[str, str] = {}
     for path in sorted(source.rglob("*")):
         if not path.is_file() or path == entry:
             continue
-        if path.suffix.lower() not in (".md", ".txt", ".json", ".yaml", ".yml", ".csv"):
+        if path.suffix.lower() not in _COMPANION_SUFFIXES:
+            continue
+        if any(part in _COMPANION_EXCLUDED_DIRS for part in path.parts):
             continue
         try:
             companions[path.relative_to(source).as_posix()] = path.read_text(encoding="utf-8")
