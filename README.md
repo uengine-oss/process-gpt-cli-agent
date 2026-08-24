@@ -50,7 +50,7 @@ someone adds Gemini. The library already treats "which agent" as data.
 Build from the service directory:
 
 ```bash
-IMAGE_TAG=$(git rev-parse HEAD)
+IMAGE_TAG=$(git rev-parse --short=7 HEAD)
 IMAGE_NAME=ghcr.io/uengine-oss/process-gpt-cli-agent:${IMAGE_TAG}
 docker build -t ${IMAGE_NAME} .
 docker push ${IMAGE_NAME}
