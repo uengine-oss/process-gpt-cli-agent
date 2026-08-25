@@ -35,6 +35,7 @@ class Capabilities:
     """The activity's declared skills and CLI settings. Empty when unset."""
 
     skills: list[str] = field(default_factory=list)
+    tools: list[str] = field(default_factory=list)
     agent_config: dict[str, Any] = field(default_factory=dict)
 
 
@@ -80,6 +81,11 @@ def extract(definition: Any, activity_id: str) -> Capabilities:
                         break
                 return Capabilities(
                     skills=list(dict.fromkeys(_as_str_list(item.get("skills")))),
+                    tools=list(
+                        dict.fromkeys(
+                            _as_str_list(item.get("tools") or item.get("mcpServers"))
+                        )
+                    ),
                     agent_config=config,
                 )
     return Capabilities()

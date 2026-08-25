@@ -76,7 +76,7 @@ def install(provider, workdir: Path, servers: list[McpServer]) -> BridgeResult:
     env = _isolate_config_home(provider, workdir)
 
     try:
-        result = provider.install_bridge(str(workdir), _ENTRY_COMMAND, servers)
+        result = provider.install_bridge(str(workdir), _ENTRY_COMMAND, servers, env=env)
     except Exception as exc:  # noqa: BLE001 - degraded, not fatal
         # Tools are how the agent reaches the process; losing them makes for a
         # worse answer, not a failed run. The caller surfaces this.
@@ -118,6 +118,15 @@ def _isolate_config_home(provider, workdir: Path) -> dict[str, str]:
         raise BridgeIsolationError(f"could not create an isolated config home: {exc}") from exc
 
     return {variable: str(home)}
+
+
+def runtime_env(provider, workdir: Path) -> dict[str, str]:
+    """Provider-local state without dropping the deployment environment."""
+    if provider.id == "claude-code":
+        home = workdir / ".agent-home" / provider.id
+        home.mkdir(parents=True, exist_ok=True)
+        return {"CLAUDE_CONFIG_DIR": str(home)}
+    return _isolate_config_home(provider, workdir)
 
 
 def processgpt_servers(

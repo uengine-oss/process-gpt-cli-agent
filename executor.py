@@ -23,17 +23,18 @@ from a2a.helpers import new_text_artifact_update_event, new_text_status_update_e
 from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.events import EventQueue
 from a2a.types import TaskState
-from cliagents import ExecEventKind
+from cliagents import ArtifactKind, ExecEventKind
 from google.protobuf.json_format import ParseDict
 from processgpt_agent_sdk import emit_chunk_json, is_chat_request
 from typing_extensions import override
 
-from core import activity, bridge, hitl, skills
+from core import activity, bridge, hitl, skills, subagents
 from core import events as ui_events
 from core import prompt as prompt_builder
 from core.journal import Journal
 from core.outcome import interpret
 from core.runner import ConcurrencyLimit, RunTimeoutError, astream
+from core.runtime import RuntimeLease
 from core.selection import CliSelectionError, require_runnable, resolve
 from core.settings import settings
 from core.stream_registry import registry as stream_registry
@@ -60,6 +61,7 @@ class CliAgentExecutor(AgentExecutor):
         run_id = task_id or context_id or "run"
         tenant_id = str(row.get("tenant_id") or extras.get("tenant_id") or "")
         workspace = for_run(run_id, tenant_id=tenant_id)
+        runtime_lease = RuntimeLease(workspace.path)
 
         try:
             await self._run(
@@ -71,6 +73,7 @@ class CliAgentExecutor(AgentExecutor):
                 context_id=context_id,
                 workspace=workspace,
                 chat=chat,
+                runtime_lease=runtime_lease,
             )
         except CliSelectionError as exc:
             # Never substitute another agent: the work item named one, and
@@ -93,6 +96,11 @@ class CliAgentExecutor(AgentExecutor):
                 text=f"실행 제한 시간을 초과했습니다({exc}). 지금까지의 산출물은 보존됩니다.",
             )
             raise
+        finally:
+            # Native agent definitions can contain tenant MCP credentials.
+            # Restore/remove every managed runtime file after every attempt;
+            # sessions and business artifacts are deliberately not managed.
+            runtime_lease.restore()
 
     async def _run(
         self,
@@ -105,6 +113,7 @@ class CliAgentExecutor(AgentExecutor):
         context_id: str,
         workspace: Workspace,
         chat: bool,
+        runtime_lease: RuntimeLease,
     ) -> None:
         # The designer's choices for this activity — which CLI, which skills —
         # live in the process definition, not on the work item row. Read once,
@@ -126,13 +135,43 @@ class CliAgentExecutor(AgentExecutor):
         journal = Journal(workspace.path)
         journal.capture_baseline(workspace.path)
 
+        # Resolve capabilities before writing anything. MCP is attached to
+        # native subagents, never to the parent CLI session.
+        tenant_servers = bridge.processgpt_servers(tenant_mcp=extras.get("tenant_mcp"))
+        requested_skills = _named_skills(row, extras) or declared.skills
+        runtime_agents = subagents.prepare(
+            list(extras.get("agents") or []),
+            tenant_servers=tenant_servers,
+            fallback_skills=requested_skills,
+            fallback_tools=declared.tools,
+        )
+        selected_skills = (
+            subagents.selected_skill_names(runtime_agents)
+            if extras.get("agents")
+            else requested_skills
+        )
+
         # --- what the agent can read -----------------------------------
         bundle, skill_failures = skills.build_bundle(
-            instructions=_instructions(row, extras, workspace),
-            skill_names=_named_skills(row, extras) or declared.skills,
+            instructions=(
+                _instructions(row, extras, workspace)
+                + "\n\n"
+                + subagents.delegation_instructions(runtime_agents)
+            ),
+            skill_names=selected_skills,
             git_skills=_git_skills(row, extras),
+            tenant_id=str(row.get("tenant_id") or extras.get("tenant_id") or ""),
         )
-        provisioned = skills.provision(provider, bundle, workspace.path, skill_failures)
+        runtime_agents = subagents.preload_discovered_skills(
+            runtime_agents,
+            [artifact.name for artifact in bundle.of_kind(ArtifactKind.SKILL)],
+        )
+        subagents.provision_definitions(
+            provider, bundle, runtime_agents, workspace.path, runtime_lease
+        )
+        provisioned = skills.provision(
+            provider, bundle, workspace.path, skill_failures, lease=runtime_lease
+        )
         if provisioned.failed:
             await self._notice(
                 context,
@@ -143,18 +182,10 @@ class CliAgentExecutor(AgentExecutor):
                 + ", ".join(f"{k} ({v})" for k, v in provisioned.failed.items()),
             )
 
-        # --- what the agent can do -------------------------------------
-        servers = bridge.processgpt_servers(tenant_mcp=extras.get("tenant_mcp"))
-        wiring = bridge.install(provider, workspace.path, servers)
-        if wiring.failed:
-            await self._notice(
-                context,
-                event_queue,
-                task_id=task_id,
-                context_id=context_id,
-                text="일부 도구를 연결하지 못해 해당 도구 없이 진행합니다: "
-                + ", ".join(wiring.failed),
-            )
+        # Codex keeps session state under CODEX_HOME. Relocate that home per
+        # workspace; provider.exec_env merges this override into os.environ so
+        # deployment API keys are retained.
+        runtime_env = bridge.runtime_env(provider, workspace.path)
 
         # --- what the agent is asked ------------------------------------
         answer = _human_answer(row, extras)
@@ -189,7 +220,7 @@ class CliAgentExecutor(AgentExecutor):
             final_text, session_id, paused = await self._stream(
                 provider=provider,
                 request=request,
-                env=wiring.env or None,
+                env=runtime_env or None,
                 context=context,
                 event_queue=event_queue,
                 task_id=task_id,
@@ -547,11 +578,6 @@ def _named_skills(row: dict[str, Any], extras: dict[str, Any]) -> list[str]:
             return [s.strip() for s in raw.split(",") if s.strip()]
         if isinstance(raw, list):
             return [str(s).strip() for s in raw if str(s).strip()]
-    for agent in extras.get("agents") or []:
-        if isinstance(agent, dict) and agent.get("skills"):
-            raw = agent["skills"]
-            if isinstance(raw, str):
-                return [s.strip() for s in raw.split(",") if s.strip()]
     return []
 
 

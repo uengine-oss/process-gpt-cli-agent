@@ -296,3 +296,24 @@ def test_naming_no_skills_still_gets_the_bundled_ones(skill_library):
 
     assert failures == {}
     assert "expense-policy" in {a.name for a in bundle.artifacts}
+
+
+def test_uploaded_skills_are_resolved_only_from_the_current_tenant(tmp_path, monkeypatch):
+    root = tmp_path / "skills"
+    for tenant, body in (("tenant-a", "A only"), ("tenant-b", "B only")):
+        folder = root / tenant / "shared"
+        folder.mkdir(parents=True)
+        (folder / "SKILL.md").write_text(body, encoding="utf-8")
+    monkeypatch.setattr(
+        skills,
+        "settings",
+        dataclasses.replace(settings, skills_dirs=(root,), system_skills_dir=tmp_path / "none"),
+    )
+
+    bundle, failures = skills.build_bundle(
+        instructions="", skill_names=["shared"], tenant_id="tenant-a"
+    )
+    assert failures == {}
+    artifact = next(a for a in bundle.artifacts if a.name == "shared")
+    assert artifact.content == "A only"
+    assert "B only" not in artifact.content

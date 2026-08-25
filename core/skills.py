@@ -24,6 +24,7 @@ from pathlib import Path
 
 from cliagents import ArtifactBundle, DirectorySink
 
+from .runtime import RuntimeLease
 from .settings import settings
 
 logger = logging.getLogger(__name__)
@@ -70,6 +71,7 @@ def build_bundle(
     instructions: str,
     skill_names: list[str] | None = None,
     git_skills: dict[str, str] | None = None,
+    tenant_id: str = "",
 ) -> tuple[ArtifactBundle, dict[str, str]]:
     """Collect everything the run should be able to read.
 
@@ -83,7 +85,7 @@ def build_bundle(
         bundle.add_constitution(instructions)
 
     wanted = set(skill_names or [])
-    available = _discover_local_skills()
+    available = _discover_local_skills(tenant_id)
     for name, folder in available.items():
         # An empty selection means "everything available" — a work item that
         # named no skills should still get the system ones.
@@ -112,8 +114,17 @@ def build_bundle(
     return bundle, failures
 
 
-def provision(provider, bundle: ArtifactBundle, workdir: Path, failures: dict[str, str]) -> Provisioned:
+def provision(
+    provider,
+    bundle: ArtifactBundle,
+    workdir: Path,
+    failures: dict[str, str],
+    lease: RuntimeLease | None = None,
+) -> Provisioned:
     """Write the bundle into ``workdir`` the way ``provider`` expects to read it."""
+    plan = provider.plan(bundle)
+    if lease is not None:
+        lease.capture([workdir / path for path in plan.paths])
     result = provider.emit(bundle, DirectorySink(str(workdir)))
     return Provisioned(
         paths=result.paths,
@@ -123,7 +134,7 @@ def provision(provider, bundle: ArtifactBundle, workdir: Path, failures: dict[st
     )
 
 
-def _discover_local_skills() -> dict[str, Path]:
+def _discover_local_skills(tenant_id: str = "") -> dict[str, Path]:
     """Skill folders on disk, later directories overriding earlier names.
 
     Two shapes are accepted because both are written: bundled skills sit
@@ -137,7 +148,13 @@ def _discover_local_skills() -> dict[str, Path]:
     agent that ignored it.
     """
     found: dict[str, Path] = {}
-    roots = [settings.system_skills_dir, *settings.skills_dirs]
+    roots: list[Path] = [settings.system_skills_dir]
+    for configured in settings.skills_dirs:
+        if tenant_id:
+            roots.extend((configured / tenant_id, configured / tenant_id / "local"))
+        else:
+            # Backward-compatible only for non-tenant utility calls and tests.
+            roots.append(configured)
     for root in roots:
         if not root.is_dir():
             continue

@@ -10,7 +10,7 @@ import time
 import pytest
 from cliagents import ExecEvent, ExecEventKind, Permission, registry
 
-from core import bridge, events, hitl, journal, selection, workspace
+from core import bridge, events, hitl, journal, selection, subagents, workspace
 from core.settings import settings
 
 
@@ -144,6 +144,12 @@ def test_a_project_scoped_agent_needs_no_isolation(tmp_path):
     assert bridge._isolate_config_home(provider, tmp_path) == {}
 
 
+def test_claude_runtime_uses_an_isolated_user_config_to_avoid_project_trust(tmp_path):
+    provider = registry.get("claude-code")
+    env = bridge.runtime_env(provider, tmp_path)
+    assert env["CLAUDE_CONFIG_DIR"].startswith(str(tmp_path))
+
+
 def test_an_unisolatable_global_agent_refuses_rather_than_share_tools(tmp_path):
     """Sharing a config home between tenants would leak tools and credentials."""
 
@@ -162,6 +168,44 @@ def test_tenant_mcp_config_is_read_as_data():
     )
     assert [s.name for s in servers] == ["office"]
     assert servers[0].env["TENANT"] == "acme"
+
+
+def test_each_native_subagent_gets_only_its_declared_tenant_server():
+    servers = bridge.processgpt_servers(
+        tenant_mcp={
+            "mcpServers": {
+                "office": {"command": "office"},
+                "hr": {"command": "hr"},
+            }
+        }
+    )
+    agents = subagents.prepare(
+        [{"name": "Reviewer", "tools": "office", "skills": "expense-policy"}],
+        tenant_servers=servers,
+        fallback_skills=[],
+        fallback_tools=[],
+    )
+    assert [server.name for server in agents[0].servers] == ["office"]
+    assert agents[0].skills == ["expense-policy"]
+
+
+def test_no_explicit_agent_creates_an_activity_worker():
+    servers = bridge.processgpt_servers(
+        tenant_mcp={"mcpServers": {"office": {"command": "office"}}}
+    )
+    agents = subagents.prepare(
+        [], tenant_servers=servers, fallback_skills=["policy"], fallback_tools=[]
+    )
+    assert [agent.name for agent in agents] == ["processgpt-worker"]
+    assert [server.name for server in agents[0].servers] == ["office"]
+
+
+def test_synthesized_worker_preloads_default_discovered_skills():
+    agents = subagents.prepare(
+        [], tenant_servers=[], fallback_skills=[], fallback_tools=[]
+    )
+    updated = subagents.preload_discovered_skills(agents, ["system", "tenant-policy"])
+    assert updated[0].skills == ["system", "tenant-policy"]
 
 
 # --- pausing for a human --------------------------------------------------
@@ -330,6 +374,7 @@ def test_an_activitys_skills_and_cli_come_from_the_process_definition():
             {
                 "id": "review",
                 "skills": ["hwpx-writer", "expense-policy"],
+                "tools": ["office"],
                 "agentConfig": {"agent_cli": "codex", "model": "gpt-5"},
             },
         ]
@@ -337,6 +382,7 @@ def test_an_activitys_skills_and_cli_come_from_the_process_definition():
 
     declared = activity.extract(definition, "review")
     assert declared.skills == ["hwpx-writer", "expense-policy"]
+    assert declared.tools == ["office"]
     assert declared.agent_config["agent_cli"] == "codex"
 
 
