@@ -60,8 +60,17 @@ jobs:
         run: |
           cd gitops-repo
           test -f deployments/process-gpt-cli-agent.yaml
-          yq eval '.spec.template.spec.containers[0].image = strenv(IMAGE_NAME)' \
-            -i deployments/process-gpt-cli-agent.yaml
+          # Deployment 문서에만 쓴다.
+          #
+          # 문서 선택자 없이 돌리면 이 파일의 **모든** 문서에 적용된다. yq 의 대입은
+          # 없는 경로를 만들어 내므로, 같은 파일에 있는 PersistentVolumeClaim 에
+          # spec.template.spec.containers[0].image 가 생긴다. PVC 에 없는 필드라
+          # kubectl 패치가 거부되고, 그러면 이 앱의 모든 ArgoCD sync 가 함께 실패해
+          # 다른 서비스 배포까지 멈춘다 — 실제로 그래서 deepagents 가 CI 성공에도
+          # 옛 이미지에 머물렀다.
+          yq eval -i \
+            '(select(.kind == "Deployment") | .spec.template.spec.containers[0].image) = strenv(IMAGE_NAME)' \
+            deployments/process-gpt-cli-agent.yaml
 
       - name: Commit and push GitOps change
         env:
