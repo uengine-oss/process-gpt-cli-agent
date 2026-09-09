@@ -125,19 +125,68 @@ def output_contract(form_fields: Any) -> str:
             "작업을 마치면 마지막 메시지에 최종 결과 본문을 그대로 작성하세요."
         )
 
-    described = "\n".join(
-        f"- `{f['key']}`: {f.get('label') or f['key']}"
-        + (f" (형식: {f['type']})" if f.get("type") else "")
-        for f in fields
-    )
+    described = "\n".join(_describe(f) for f in fields)
     skeleton = json.dumps({f["key"]: "" for f in fields}, ensure_ascii=False, indent=2)
-    return (
-        "## 결과 제출 형식\n"
+    lines = [
+        "## 결과 제출 형식",
         "작업을 마치면 **마지막 메시지에 아래 JSON 객체 하나만** 출력하세요. "
-        "설명 문장이나 코드펜스 밖 텍스트를 함께 쓰지 마세요.\n\n"
-        f"필드:\n{described}\n\n"
-        f"형태:\n```json\n{skeleton}\n```"
-    )
+        "설명 문장이나 코드펜스 밖 텍스트를 함께 쓰지 마세요.",
+        "",
+        f"필드:\n{described}",
+    ]
+    if any(f.get("choices") for f in fields):
+        # 선택지가 있는 필드에 다른 말을 써 넣으면 게이트웨이 분기 조건이 그 값과
+        # 어긋나 결정론 판정이 통째로 실패한다(엔진이 LLM 폴백으로 넘어간다).
+        lines.append(
+            "선택지가 있는 필드는 **허용값 중 하나를 그대로** 쓰세요. "
+            "뜻이 같아 보이는 다른 표현('예', 'Y', 'true' 등)으로 바꾸지 마세요."
+        )
+    lines.append(f"\n형태:\n```json\n{skeleton}\n```")
+    return "\n".join(lines)
+
+
+def _describe(field: dict[str, Any]) -> str:
+    line = f"- `{field['key']}`: {field.get('label') or field['key']}"
+    if field.get("type"):
+        line += f" (형식: {field['type']})"
+    choices = field.get("choices") or []
+    if choices:
+        allowed = ", ".join(
+            f"`{value}`" + (f"({label})" if label and label != value else "")
+            for value, label in choices
+        )
+        line += f"\n  허용값(이 중 하나를 그대로): {allowed}"
+    return line
+
+
+def _choices(raw: Any) -> list[tuple[str, str]]:
+    """select/radio/checkbox 필드의 허용값 목록.
+
+    폼 정의(form_def.fields_json)는 `items` 를 `[{"<값>": "<표시문구>"}]` 로 적는다.
+    다른 작성자가 남긴 `[{"value": .., "label": ..}]` 이나 문자열 배열도 받아 준다.
+    """
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw.replace("'", '"'))
+        except json.JSONDecodeError:
+            return []
+    if not isinstance(raw, list):
+        return []
+
+    out: list[tuple[str, str]] = []
+    for item in raw:
+        if isinstance(item, str):
+            out.append((item, item))
+        elif isinstance(item, dict):
+            if "value" in item or "key" in item:
+                value = item.get("value") or item.get("key")
+                label = item.get("label") or item.get("text") or item.get("title") or ""
+                if value is not None:
+                    out.append((str(value), str(label)))
+            else:
+                for value, label in item.items():
+                    out.append((str(value), str(label)))
+    return [(v, l) for v, l in out if v]
 
 
 def _field_list(form_fields: Any) -> list[dict[str, Any]]:
@@ -162,8 +211,14 @@ def _field_list(form_fields: Any) -> list[dict[str, Any]]:
         out.append(
             {
                 "key": str(key),
-                "label": field.get("label") or field.get("title") or "",
+                # `text` 는 form_def.fields_json 이 쓰는 이름이다. 이걸 빼먹으면
+                # 에이전트는 한글 라벨 없이 키만 보고 값을 지어낸다.
+                "label": field.get("label")
+                or field.get("text")
+                or field.get("title")
+                or "",
                 "type": field.get("type") or "",
+                "choices": _choices(field.get("items") or field.get("options")),
             }
         )
     return out
