@@ -15,7 +15,7 @@ dependencies = [
     # Pulled from git rather than PyPI because the exec surface this service
     # depends on lives there; pin to a tag before a production rollout.
     "cliagents @ git+https://github.com/uengine-oss/cliagents@main",
-    "process-gpt-agent-sdk[sse]==0.4.23",
+    "process-gpt-agent-sdk[sse]==0.10.0",
     "a2a-sdk==1.1.0",
     "protobuf==6.33.6",
     "starlette==1.2.1",
