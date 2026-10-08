@@ -15,6 +15,7 @@ the form wanted fields fails instead of storing a shrug.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import logging
 from typing import Any
@@ -30,6 +31,7 @@ from typing_extensions import override
 
 from core import activity, bridge, hitl, resume, skills, subagents
 from core import events as ui_events
+from core import timeline
 from core import prompt as prompt_builder
 from core.journal import Journal
 from core.outcome import interpret
@@ -46,6 +48,10 @@ logger = logging.getLogger(__name__)
 #: container rather than of one work item.
 limiter = ConcurrencyLimit(settings.max_concurrent_runs)
 
+#: The timeline card this run writes to (``timeline.job_id``). A context
+#: variable, not an attribute: one executor serves concurrent runs.
+_JOB_ID: contextvars.ContextVar[str] = contextvars.ContextVar("cli_agent_job_id", default="")
+
 
 class CliAgentExecutor(AgentExecutor):
     """Runs a work item on the CLI agent the work item asked for."""
@@ -57,6 +63,7 @@ class CliAgentExecutor(AgentExecutor):
         task_id = str(context.task_id or "")
         context_id = str(context.context_id or "")
         chat = is_chat_request(context)
+        _JOB_ID.set(timeline.job_id(task_id, row))
 
         run_id = task_id or context_id or "run"
         tenant_id = str(row.get("tenant_id") or extras.get("tenant_id") or "")
@@ -214,6 +221,7 @@ class CliAgentExecutor(AgentExecutor):
         )
 
         # --- run --------------------------------------------------------
+        cli_errors: list[str] = []
         stream_registry.start(workspace.run_id)
         async with limiter:
             final_text, session_id, paused = await self._stream(
@@ -226,6 +234,8 @@ class CliAgentExecutor(AgentExecutor):
                 context_id=context_id,
                 workspace=workspace,
                 journal=journal,
+                record=not chat,
+                errors=cli_errors,
             )
 
         # Whatever happened next — paused, stored, failed — this stream is
@@ -272,6 +282,10 @@ class CliAgentExecutor(AgentExecutor):
                 text=(
                     f"결과가 요구된 출력 형식과 맞지 않습니다: {outcome.mismatch_reason}\n\n"
                     f"에이전트 응답:\n{outcome.raw_text}"
+                    # The CLI's own error ("Not logged in", a crashed tool) is
+                    # usually the real cause; without it the card only says
+                    # the answer had the wrong shape.
+                    + ("\n\nCLI 오류:\n" + "\n".join(cli_errors) if cli_errors else "")
                 ),
             )
             return
@@ -298,12 +312,28 @@ class CliAgentExecutor(AgentExecutor):
         context_id: str,
         workspace: Workspace,
         journal: Journal,
+        record: bool = True,
+        errors: list[str] | None = None,
     ) -> tuple[str, str | None, str | None]:
-        """Forward progress to the UI. Returns (final text, session, pause)."""
+        """Forward progress to the UI. Returns (final text, session, pause).
+
+        Two audiences: the chat stream (SSE chunks, gone on refresh) and, for a
+        work item (``record``), the stored timeline the work-item screen draws.
+        CLI error messages are appended to ``errors`` for the failure text.
+        """
         final_text = ""
         session_id: str | None = None
         pause_reason: str | None = None
         streamed: list[str] = []
+        open_tools = timeline.OpenTools(workspace.path)
+
+        if record:
+            # A run that died mid-tool left that tool open on the card. This
+            # run took over; say so on the tool instead of spinning forever.
+            await self._timeline(
+                event_queue, task_id=task_id, context_id=context_id,
+                rows=open_tools.close_interrupted(),
+            )
 
         async for event in astream(
             provider, request, env=env, timeout=settings.run_timeout_seconds
@@ -327,6 +357,15 @@ class CliAgentExecutor(AgentExecutor):
                 self._record_file(journal, workspace, event)
             elif event.kind is ExecEventKind.TOOL_END and event.tool and "/" in event.tool:
                 journal.record_tool(event.tool, event.tool_input, external=True)
+            elif event.kind is ExecEventKind.ERROR and event.text and errors is not None:
+                errors.append(event.text)
+
+            if record:
+                rows = timeline.translate(event)
+                # Persist before sending: if the process dies right after a
+                # start is stored, the next run must know to close it.
+                open_tools.track(rows)
+                await self._timeline(event_queue, task_id=task_id, context_id=context_id, rows=rows)
 
             for ui_event in ui_events.translate(event, workspace=workspace):
                 payload = ui_event.as_dict()
@@ -336,6 +375,21 @@ class CliAgentExecutor(AgentExecutor):
                 stream_registry.publish(workspace.run_id, payload)
 
         return (final_text or "".join(streamed)).strip(), session_id, pause_reason
+
+    async def _timeline(
+        self, event_queue: EventQueue, *, task_id: str, context_id: str, rows: list
+    ) -> None:
+        """Store timeline rows (tool calls, plan) on this run's card."""
+        for row in rows:
+            await self._status(
+                event_queue,
+                task_id=task_id,
+                context_id=context_id,
+                state=TaskState.TASK_STATE_WORKING,
+                text=row.text(),
+                event_type=row.event_type,
+                crew_type=timeline.CREW_TYPE,
+            )
 
     @staticmethod
     def _record_file(journal: Journal, workspace: Workspace, event) -> None:
@@ -376,14 +430,16 @@ class CliAgentExecutor(AgentExecutor):
                     "goal": (row.get("activity_name") or "").strip() or "업무 수행",
                     "name": provider.display_name,
                     "role": "CLI 코딩 에이전트",
-                    "task_description": (row.get("query") or "").strip(),
+                    # The activity's Description, not ``query`` — that is the
+                    # whole prompt with the input JSON.
+                    "task_description": timeline.description_of(row),
                 },
                 ensure_ascii=False,
             ),
             event_type="task_started",
-            # Matches the completion event, so the card renders the answer text
-            # rather than a raw payload dump.
-            crew_type="result",
+            # The work card: progress and tool calls. The answer goes on its
+            # own result card (_complete), where it can be adopted.
+            crew_type=timeline.CREW_TYPE,
         )
 
     async def _complete(
@@ -406,6 +462,32 @@ class CliAgentExecutor(AgentExecutor):
             payload["replay_limited"] = journal.limitations()
 
         body = json.dumps(payload, ensure_ascii=False)
+        # Close the work card without a result (``{}``), then put the answer on
+        # its own result card — as deepagents does. "채택" is offered only there,
+        # so the work card is never adopted into the form.
+        await self._status(
+            event_queue,
+            task_id=task_id,
+            context_id=context_id,
+            state=TaskState.TASK_STATE_WORKING,
+            text="{}",
+            event_type="task_completed",
+            crew_type=timeline.CREW_TYPE,
+        )
+        result_job = timeline.result_job_id(_JOB_ID.get() or task_id)
+        await self._status(
+            event_queue,
+            task_id=task_id,
+            context_id=context_id,
+            state=TaskState.TASK_STATE_WORKING,
+            text=json.dumps(
+                {"goal": "최종 결과를 반환합니다.", "name": "최종 결과 반환", "role": "최종 결과 반환"},
+                ensure_ascii=False,
+            ),
+            event_type="task_started",
+            crew_type=timeline.RESULT_CREW_TYPE,
+            job_id=result_job,
+        )
         await self._status(
             event_queue,
             task_id=task_id,
@@ -413,7 +495,8 @@ class CliAgentExecutor(AgentExecutor):
             state=TaskState.TASK_STATE_COMPLETED,
             text=body,
             event_type="task_completed",
-            crew_type="result",
+            crew_type=timeline.RESULT_CREW_TYPE,
+            job_id=result_job,
         )
 
         # `last_chunk` means "the run is over", not "the item is closed". The
@@ -458,6 +541,21 @@ class CliAgentExecutor(AgentExecutor):
                 {"type": "human_input_required", "question": question, "agent": agent_id},
             )
 
+        # End this stretch's card before the question. The answer starts the
+        # next card (``timeline.job_id``), so the screen reads work → question →
+        # work. An empty body (``{}``): the card says "done" without a result
+        # box, so nothing here can be adopted into the form by mistake. Not an
+        # empty string — the SDK stores the whole message object for that.
+        await self._status(
+            event_queue,
+            task_id=task_id,
+            context_id=context_id,
+            state=TaskState.TASK_STATE_WORKING,
+            text="{}",
+            event_type="task_completed",
+            crew_type=timeline.CREW_TYPE,
+        )
+
         await self._status(
             event_queue,
             task_id=task_id,
@@ -471,19 +569,27 @@ class CliAgentExecutor(AgentExecutor):
                 ensure_ascii=False,
             ),
             event_type="human_asked",
-            crew_type="agent",
+            crew_type=timeline.CREW_TYPE,
+            # Its own card id: the screen lists a card's tool calls under every
+            # card sharing that id, so a question on the work card's id showed
+            # the same tools twice. The answer copies this id.
+            job_id=f"{_JOB_ID.get() or task_id}:ask",
         )
 
     async def _fail(
         self, event_queue: EventQueue, *, task_id: str, context_id: str, text: str
     ) -> None:
-        await event_queue.enqueue_event(
-            new_text_status_update_event(
-                task_id=task_id,
-                context_id=context_id,
-                state=TaskState.TASK_STATE_FAILED,
-                text=json.dumps({"error": text}, ensure_ascii=False),
-            )
+        # The error card shows `friendly`; `error` alone showed only "오류가
+        # 발생했습니다". On this run's card id, so the screen closes that card as
+        # failed instead of leaving it "in progress" next to the error.
+        await self._status(
+            event_queue,
+            task_id=task_id,
+            context_id=context_id,
+            state=TaskState.TASK_STATE_FAILED,
+            text=json.dumps(timeline.failure_data(text), ensure_ascii=False),
+            event_type="error",
+            crew_type=timeline.CREW_TYPE,
         )
 
     async def _notice(
@@ -498,14 +604,16 @@ class CliAgentExecutor(AgentExecutor):
         """Tell the user about a degradation without failing the run."""
         logger.warning("run %s degraded: %s", task_id, text)
         await emit_chunk_json(context, {"type": "notice", "content": text})
+        # `notice` is not in the store's event_type enum — those rows were
+        # rejected. `task_working` is, and the card lists it with `query`.
         await self._status(
             event_queue,
             task_id=task_id,
             context_id=context_id,
             state=TaskState.TASK_STATE_WORKING,
-            text=text,
-            event_type="notice",
-            crew_type="agent",
+            text=json.dumps({"query": text, "info": text}, ensure_ascii=False),
+            event_type="task_working",
+            crew_type=timeline.CREW_TYPE,
         )
 
     async def _status(
@@ -518,12 +626,13 @@ class CliAgentExecutor(AgentExecutor):
         text: str,
         event_type: str,
         crew_type: str,
+        job_id: str | None = None,
     ) -> None:
         event = new_text_status_update_event(
             task_id=task_id, context_id=context_id, state=state, text=text
         )
         ParseDict(
-            {"event_type": event_type, "job_id": task_id, "crew_type": crew_type},
+            {"event_type": event_type, "job_id": job_id or _JOB_ID.get() or task_id, "crew_type": crew_type},
             event.metadata,
         )
         await event_queue.enqueue_event(event)

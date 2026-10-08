@@ -288,9 +288,14 @@ def test_rs_6_1_pause_is_recorded_as_a_human_asked_event_the_screen_can_answer(t
         workspace=Workspace(path=tmp_path, run_id="t"), agent_id="claude-code",
         session_id="S-1", question="This command requires approval",
     ))
-    [event] = sent
+    # 질문 앞에서 이번 구간의 카드를 닫고(본문 없음 — 채택할 결과가 아니다), 질문 카드를 연다
+    close, event = sent
+    assert dict(close.metadata.items())["event_type"] == "task_completed"
+    assert close.status.message.parts[0].text == "{}"  # 빈 문자열이면 SDK 가 메시지 원본을 저장했다
     meta = dict(event.metadata.items())
     assert meta["event_type"] == "human_asked"
+    # 질문 카드는 작업 카드와 다른 id — 같으면 화면이 작업 카드의 도구 목록을 질문 카드에도 그린다
+    assert meta["job_id"] == f"{dict(close.metadata.items())['job_id']}:ask"
     body = _json.loads(event.status.message.parts[0].text)
     assert body["question"] == "This command requires approval"
     assert body["type"] == "text"
