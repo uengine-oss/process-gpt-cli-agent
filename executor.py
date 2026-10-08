@@ -28,7 +28,7 @@ from google.protobuf.json_format import ParseDict
 from processgpt_agent_sdk import emit_chunk_json, is_chat_request
 from typing_extensions import override
 
-from core import activity, bridge, hitl, skills, subagents
+from core import activity, bridge, hitl, resume, skills, subagents
 from core import events as ui_events
 from core import prompt as prompt_builder
 from core.journal import Journal
@@ -188,27 +188,26 @@ class CliAgentExecutor(AgentExecutor):
         runtime_env = bridge.runtime_env(provider, workspace.path)
 
         # --- what the agent is asked ------------------------------------
-        answer = _human_answer(row, extras)
-        if answer:
-            plan = hitl.plan_resume(
-                workspace.path,
-                answer,
-                workspace_exists=workspace.exists,
-                previous_summary=str(row.get("draft") or "")[:2000],
+        # Why this run is starting (SDK: new / crash reclaim / human answer /
+        # revision) picks the prompt and the session to continue.
+        start = resume.plan_start(
+            workspace.path,
+            row=row,
+            extras=extras,
+            workspace_exists=workspace.exists,
+            fresh_prompt=lambda: prompt_builder.build(row, extras, workdir=str(workspace.path)),
+            previous_summary=str(row.get("draft") or "")[:2000],
+        )
+        text = start.prompt
+        resume_session = start.session_id
+        if start.notice:
+            await self._notice(
+                context,
+                event_queue,
+                task_id=task_id,
+                context_id=context_id,
+                text=start.notice,
             )
-            text = plan.prompt
-            resume_session = plan.session_id or None
-            if plan.restarted:
-                await self._notice(
-                    context,
-                    event_queue,
-                    task_id=task_id,
-                    context_id=context_id,
-                    text=f"이전 실행을 이어갈 수 없어 새로 시작합니다. ({plan.reason})",
-                )
-        else:
-            text = prompt_builder.build(row, extras, workdir=str(workspace.path))
-            resume_session = _session_of(row, extras)
 
         request = selection.to_request(
             text, str(workspace.path), resume_session=resume_session
@@ -310,6 +309,10 @@ class CliAgentExecutor(AgentExecutor):
             provider, request, env=env, timeout=settings.run_timeout_seconds
         ):
             if event.session_id:
+                if event.session_id != session_id:
+                    # Saved now, not at completion: a run killed halfway is the
+                    # one a reclaim has to continue.
+                    resume.remember_session(workspace.path, event.session_id)
                 session_id = event.session_id
 
             if event.kind is ExecEventKind.RESULT:
@@ -595,31 +598,3 @@ def _git_skills(row: dict[str, Any], extras: dict[str, Any]) -> dict[str, str]:
         except json.JSONDecodeError:
             return {}
     return {str(k): str(v) for k, v in raw.items()} if isinstance(raw, dict) else {}
-
-
-def _human_answer(row: dict[str, Any], extras: dict[str, Any]) -> str:
-    """The reply to a question this run asked earlier, if there is one."""
-    for key in ("human_answer", "feedback_answer", "user_answer"):
-        value = row.get(key) or extras.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    return ""
-
-
-def _session_of(row: dict[str, Any], extras: dict[str, Any]) -> str | None:
-    """The CLI session this conversation is already using, if any."""
-    for source in (row, extras):
-        value = source.get("cliagents_session_id")
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    draft = row.get("draft") or row.get("output")
-    if isinstance(draft, str) and draft.strip().startswith("{"):
-        try:
-            parsed = json.loads(draft)
-        except json.JSONDecodeError:
-            return None
-        value = parsed.get("cliagents_session_id") if isinstance(parsed, dict) else None
-        return value if isinstance(value, str) and value.strip() else None
-    return None
-
-
