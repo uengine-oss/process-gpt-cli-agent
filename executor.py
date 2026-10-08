@@ -234,9 +234,10 @@ class CliAgentExecutor(AgentExecutor):
         # left hanging until its own timeout.
         stream_registry.finish(workspace.run_id)
 
-        if paused is not None and not final_text:
-            # A refusal with nothing to show is a real block: the agent could
-            # not get past it, so a person has to decide.
+        outcome = interpret(final_text, extras.get("form_fields"))
+        if hitl.should_pause(refused=paused is not None, final_text=final_text, contract_met=outcome.contract_met):
+            # A refusal with nothing usable to show is a real block: the agent
+            # could not get past it, so a person has to decide.
             await self._pause(
                 context=context,
                 event_queue=event_queue,
@@ -245,7 +246,7 @@ class CliAgentExecutor(AgentExecutor):
                 workspace=workspace,
                 agent_id=selection.agent_id,
                 session_id=session_id or "",
-                question=paused,
+                question=paused or "",
             )
             return
 
@@ -264,7 +265,6 @@ class CliAgentExecutor(AgentExecutor):
             )
 
         # --- store ------------------------------------------------------
-        outcome = interpret(final_text, extras.get("form_fields"))
         if not outcome.contract_met:
             await self._fail(
                 event_queue,
@@ -316,10 +316,10 @@ class CliAgentExecutor(AgentExecutor):
                 final_text = event.text or final_text
             elif event.kind is ExecEventKind.ASSISTANT_TEXT:
                 streamed.append(event.text)
-            elif event.kind is ExecEventKind.PERMISSION_REQUEST:
+            elif (refusal := hitl.permission_refusal(event)) is not None:
                 # First refusal wins: the rest of the run is the agent trying
                 # to work around a wall it cannot get past.
-                pause_reason = pause_reason or (event.text or "권한이 필요합니다")
+                pause_reason = pause_reason or refusal
             elif event.kind is ExecEventKind.FILE_CHANGE and event.path:
                 self._record_file(journal, workspace, event)
             elif event.kind is ExecEventKind.TOOL_END and event.tool and "/" in event.tool:
@@ -460,8 +460,14 @@ class CliAgentExecutor(AgentExecutor):
             task_id=task_id,
             context_id=context_id,
             state=TaskState.TASK_STATE_INPUT_REQUIRED,
-            text=question,
-            event_type="human_input_required",
+            # The work-item screen draws its question card from a `human_asked`
+            # event and reads `question`/`type` from its data. Any other event
+            # type is not in the store's enum and is never saved.
+            text=json.dumps(
+                {"question": question, "type": "text", "agent": agent_id, "role": "CLI 코딩 에이전트"},
+                ensure_ascii=False,
+            ),
+            event_type="human_asked",
             crew_type="agent",
         )
 

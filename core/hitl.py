@@ -145,3 +145,36 @@ def plan_resume(
     prompt += "\n위 맥락을 참고해 작업을 새로 진행하세요."
 
     return ResumePlan(session_id="", prompt=prompt, restarted=True, reason=reason)
+
+
+#: Refusal wording the CLI library does not recognise yet. Claude Code 2.1.216
+#: answers a Bash call that needs approval with this tool error; cliagents only
+#: knows older wordings, so without this the refusal reads as an ordinary
+#: tool failure and nobody is ever asked.
+_EXTRA_REFUSAL_MARKERS = ("requires approval",)
+
+
+def permission_refusal(event) -> str | None:
+    """The refusal text when ``event`` is the agent being stopped for permission."""
+    from cliagents import ExecEventKind
+
+    if event.kind is ExecEventKind.PERMISSION_REQUEST:
+        return event.text or "권한이 필요합니다"
+    if event.kind is ExecEventKind.TOOL_END and event.is_error:
+        text = event.text or ""
+        if any(marker in text.lower() for marker in _EXTRA_REFUSAL_MARKERS):
+            return text
+    return None
+
+
+def should_pause(*, refused: bool, final_text: str, contract_met: bool) -> bool:
+    """Whether a refused run waits for a person instead of being stored or failed.
+
+    A refusal followed by a usable result means the agent worked around it —
+    store that. A refusal followed by nothing, or by an apology that does not
+    fill the form, is a real block: failing it would give the person no chance
+    to allow what was asked.
+    """
+    if not refused:
+        return False
+    return not final_text or not contract_met
