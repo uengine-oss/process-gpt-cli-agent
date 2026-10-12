@@ -379,7 +379,9 @@ class CliAgentExecutor(AgentExecutor):
     async def _timeline(
         self, event_queue: EventQueue, *, task_id: str, context_id: str, rows: list
     ) -> None:
-        """Store timeline rows (tool calls, plan) on this run's card."""
+        """Store timeline rows — tool calls and plan on this run's card, a
+        subagent on a card of its own (``<job>:agent:<call id>``)."""
+        job = _JOB_ID.get() or task_id
         for row in rows:
             await self._status(
                 event_queue,
@@ -389,6 +391,7 @@ class CliAgentExecutor(AgentExecutor):
                 text=row.text(),
                 event_type=row.event_type,
                 crew_type=timeline.CREW_TYPE,
+                job_id=f"{job}:{row.card}" if row.card else None,
             )
 
     @staticmethod

@@ -12,6 +12,7 @@ import asyncio
 import json
 from typing import Any
 
+import pytest
 from cliagents import ExecEvent, ExecEventKind
 
 from core import timeline
@@ -88,6 +89,9 @@ def test_long_results_are_cut():
 def test_failure_body_has_the_key_the_error_card_shows():
     body = timeline.failure_data("결과가 형식과 맞지 않습니다")
     assert body["friendly"] == "결과가 형식과 맞지 않습니다"  # 없으면 "오류가 발생했습니다" 만 보였다
+    # 카드 제목·설명 — 없으면 오류 카드가 번호만 있는 빈 머리로 보였다(SDK 오류 이벤트와 같은 값)
+    assert body["name"] == "시스템 오류 알림"
+    assert body["goal"] == "오류 원인과 대처 안내를 전달합니다."
 
 
 # ---------------------------------------------------------------------------
@@ -333,3 +337,68 @@ def test_every_row_but_the_result_card_is_crew_type_cliagents(tmp_path):
 
     asyncio.run(go())
     assert {c for _, _, c, _ in _crew_rows(q)} == {"cliagents"}
+
+
+# ---------------------------------------------------------------------------
+# 서브에이전트 위임(Claude Code Agent/Task 도구)은 도구 한 줄이 아니라 작업 카드
+# ---------------------------------------------------------------------------
+
+def _agent_start(tool_use_id="A1", tool="Agent"):
+    return ExecEvent(kind=ExecEventKind.TOOL_START, tool=tool, tool_use_id=tool_use_id,
+                     tool_input={"subagent_type": "worker", "description": "고객 불만 분류 및 조치 답변 작성",
+                                 "prompt": "긴 지시 …"})
+
+
+def _agent_end(tool_use_id="A1", text="조치 결과 보고서"):
+    return ExecEvent(kind=ExecEventKind.TOOL_END, tool="Agent", tool_use_id=tool_use_id,
+                     tool_output=[{"type": "text", "text": text}])
+
+
+@pytest.mark.parametrize("tool", ["Agent", "Task"])
+def test_subagent_call_is_its_own_card(tool):
+    [start] = translate(_agent_start(tool=tool))
+    assert (start.event_type, start.card) == ("task_started", "agent:A1")
+    assert start.data["name"] == "고객 불만 분류 및 조치 답변 작성"   # 카드 제목 = 위임한 일
+    assert start.data["task_description"] == "서브에이전트 worker 에게 위임"
+    [end] = translate(_agent_end())
+    assert (end.event_type, end.card) == ("task_completed", "agent:A1")
+    assert end.data["result"] == "조치 결과 보고서"
+
+
+def test_stream_puts_the_subagent_on_its_own_card_between_work_and_result(monkeypatch, tmp_path):
+    q = _run_stream(monkeypatch, tmp_path, [_bash_start("ls", "T1"), _bash_end("a", "T1"), _agent_start(), _agent_end()],
+                    job="t")
+    rows = [(t, j) for t, j, _ in q.rows()]
+    assert rows == [
+        ("tool_usage_started", "t"), ("tool_usage_finished", "t"),   # 작업 카드의 도구
+        ("task_started", "t:agent:A1"), ("task_completed", "t:agent:A1"),  # 서브에이전트 카드
+    ]
+    assert {c for _, _, c, _ in _crew_rows(q)} == {"cliagents"}  # 채택 버튼 없는 카드(결과 카드만 result)
+
+
+def test_a_subagent_cut_off_by_a_crash_is_closed_as_a_card(tmp_path):
+    OpenTools(tmp_path).track(translate(_agent_start("A9")))
+    [row] = OpenTools(tmp_path).close_interrupted()
+    assert (row.event_type, row.card) == ("task_completed", "agent:A9")
+    assert timeline.INTERRUPTED_RESULT in row.data["result"]
+
+
+def test_subagent_json_answer_is_shown_as_readable_markdown():
+    answer = '```json\n{\n  "complaint_type": "product",\n  "action_result": "## 보고서\\n\\n- 교환 처리"\n}\n```'
+    [end] = translate(_agent_end(text=answer))
+    shown = end.data["result"]
+    # 따옴표·이스케이프된 \n 이 그대로 보이지 않고, 키마다 한 구간에 값의 마크다운이 살아 있다
+    assert shown == "**complaint_type**\n\nproduct\n\n**action_result**\n\n## 보고서\n\n- 교환 처리"
+
+
+def test_plain_subagent_answer_is_kept_without_a_fence():
+    assert timeline.readable("```\n그냥 보고서\n```") == "그냥 보고서"
+    assert timeline.readable("# 제목\n본문") == "# 제목\n본문"
+
+
+def test_claude_code_subagent_trailer_is_dropped():
+    # Claude Code 2.x 가 Agent 결과 끝에 붙이는 재개용 id 와 사용량 — 사람에게 보일 것이 아니다
+    answer = ('```json\n{"complaint_type": "product"}\n```\n'
+              "agentId: a4485a53851abc1c5 (use SendMessage with to: 'a4485a53851abc1c5' to continue this agent)\n"
+              "<usage>subagent_tokens: 13136\ntool_uses: 0\nduration_ms: 58917</usage>\n")
+    assert timeline.readable(answer) == "**complaint_type**\n\nproduct"

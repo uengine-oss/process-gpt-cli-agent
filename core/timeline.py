@@ -24,6 +24,7 @@ Three rules:
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -51,6 +52,11 @@ MAX_FIELD_CHARS = 4000
 
 INTERRUPTED_RESULT = "직전 실행이 중단되어 결과를 받지 못했습니다. 이어받은 실행이 계속 진행합니다."
 
+#: Claude Code's subagent tools ("Task" before 2.x, "Agent" after). A call to
+#: one is another agent doing a piece of the work, not a tool result: it gets
+#: its own card, between the work card and the final result.
+SUBAGENT_TOOLS = ("Agent", "Task")
+
 
 @dataclass(frozen=True)
 class TimelineEvent:
@@ -58,6 +64,9 @@ class TimelineEvent:
 
     event_type: str
     data: dict[str, Any] = field(default_factory=dict)
+    #: The card this row belongs to, as a suffix of the run's card id
+    #: (``<job>:<card>``). ``None``: the run's own work card.
+    card: str | None = None
 
     def text(self) -> str:
         return json.dumps(self.data, ensure_ascii=False, default=str)
@@ -66,6 +75,13 @@ class TimelineEvent:
 def translate(event: ExecEvent) -> list[TimelineEvent]:
     """Map one exec event onto zero or more timeline rows."""
     kind = event.kind
+
+    if kind is ExecEventKind.TOOL_START and event.tool in SUBAGENT_TOOLS:
+        return [_subagent_started(event.tool_use_id, event.tool_input)]
+
+    if kind is ExecEventKind.TOOL_END and event.tool in SUBAGENT_TOOLS:
+        output = event.tool_output if event.tool_output is not None else event.text
+        return [_subagent_finished(event.tool_use_id, output, is_error=event.is_error)]
 
     if kind is ExecEventKind.TOOL_START:
         name = _tool_name(event.tool)
@@ -115,9 +131,19 @@ def failure_data(message: str) -> dict[str, Any]:
     """The body of a failed run, in the keys the error card reads.
 
     The screen shows ``friendly`` (then ``message``) on its error card; a body
-    with only ``error`` showed "오류가 발생했습니다" and nothing more.
+    with only ``error`` showed "오류가 발생했습니다" and nothing more. The card
+    title and description come from ``name`` and ``goal`` — the same values the
+    SDK writes for its own error events, so every failure card reads alike.
     """
-    return {"friendly": message, "message": message, "error": message}
+    return {
+        "name": "시스템 오류 알림",
+        "role": "CLI 코딩 에이전트",
+        "goal": "오류 원인과 대처 안내를 전달합니다.",
+        "agent_profile": "/images/chat-icon.png",
+        "friendly": message,
+        "message": message,
+        "error": message,
+    }
 
 
 def job_id(task_id: str, row: dict[str, Any] | None) -> str:
@@ -198,9 +224,10 @@ class OpenTools:
             key = row.data.get("tool_use_id")
             if not key:
                 continue
-            if row.event_type == "tool_usage_started":
-                entries[str(key)] = str(row.data.get("tool_name") or "tool")
-            elif row.event_type == "tool_usage_finished":
+            if row.event_type in ("tool_usage_started", "task_started"):
+                # A subagent card is remembered by its card, so it is closed as a card.
+                entries[str(key)] = f"card:{row.card}" if row.card else str(row.data.get("tool_name") or "tool")
+            elif row.event_type in ("tool_usage_finished", "task_completed"):
                 entries.pop(str(key), None)
         if entries != before:
             self._save(entries)
@@ -214,7 +241,12 @@ class OpenTools:
         """
         entries = self.load()
         self._save({})
-        return [_finished(name, key, INTERRUPTED_RESULT, is_error=True) for key, name in entries.items()]
+        return [
+            _subagent_finished(key, INTERRUPTED_RESULT, is_error=True)
+            if name.startswith("card:")
+            else _finished(name, key, INTERRUPTED_RESULT, is_error=True)
+            for key, name in entries.items()
+        ]
 
 
 # --- helpers ----------------------------------------------------------------
@@ -231,6 +263,70 @@ def _finished(name: str, tool_use_id: str | None, output: Any, *, is_error: bool
             "is_error": bool(is_error),
         },
     )
+
+
+def _subagent_card(tool_use_id: str | None) -> str:
+    return f"agent:{tool_use_id or 'unknown'}"
+
+
+def _subagent_started(tool_use_id: str | None, args: Any) -> TimelineEvent:
+    """A subagent's own card: what it was asked to do, and who."""
+    args = args if isinstance(args, dict) else {}
+    agent = str(args.get("subagent_type") or "").strip()
+    what = str(args.get("description") or "").strip()
+    return TimelineEvent(
+        "task_started",
+        {
+            "name": what or agent or "서브에이전트 작업",
+            "role": "서브에이전트",
+            "goal": what,
+            "task_description": f"서브에이전트 {agent} 에게 위임" if agent else "서브에이전트에게 위임",
+            "tool_use_id": tool_use_id,
+        },
+        card=_subagent_card(tool_use_id),
+    )
+
+
+def _subagent_finished(tool_use_id: str | None, output: Any, *, is_error: bool) -> TimelineEvent:
+    text = _cut(readable(_as_text(output)))
+    return TimelineEvent(
+        "task_completed",
+        {"result": f"오류: {text}" if is_error and text else text, "tool_use_id": tool_use_id},
+        card=_subagent_card(tool_use_id),
+    )
+
+
+#: What Claude Code appends to a subagent's answer for its own use — the id to
+#: resume that subagent with, and token accounting. Not for a person.
+_CLAUDE_TRAILER = re.compile(r"(?:^|\n)agentId: \S+[^\n]*|<usage>.*?</usage>", flags=re.S)
+
+
+def readable(text: str) -> str:
+    """A subagent's answer as markdown a person can read on the card.
+
+    Subagents often answer with JSON — the parent asked for the form — wrapped
+    in a ```json fence. Shown as is, the card was one long line of quotes and
+    literal ``\\n``. A JSON object becomes one section per key (the value's own
+    markdown kept); anything else is returned without the fence.
+    """
+    body = _CLAUDE_TRAILER.sub("", text or "").strip()
+    fenced = re.fullmatch(r"```[a-zA-Z0-9_-]*\s*\n(.*?)\n?```", body, flags=re.S)
+    if fenced:
+        body = fenced.group(1).strip()
+    try:
+        parsed = json.loads(body)
+    except ValueError:
+        return body
+    if not isinstance(parsed, dict) or not parsed:
+        return body
+    sections = []
+    for key, value in parsed.items():
+        if isinstance(value, str):
+            shown = value.strip()
+        else:
+            shown = "```json\n" + json.dumps(value, ensure_ascii=False, indent=2) + "\n```"
+        sections.append(f"**{key}**\n\n{shown}")
+    return "\n\n".join(sections)
 
 
 def _tool_name(tool: str | None) -> str:
