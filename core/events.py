@@ -23,6 +23,12 @@ from cliagents import ExecEvent, ExecEventKind
 
 from .settings import settings
 
+#: Raw CLI event types that describe the *account* the CLI runs under, not the
+#: run. Claude Code's ``rate_limit_event`` carries the subscription's usage and
+#: reset times; passed through as ``agent_log`` it reached every chat user's
+#: browser. Dropped here, the one exception to "unknown still produces something".
+_ACCOUNT_EVENT_TYPES = frozenset({"rate_limit_event"})
+
 
 @dataclass(frozen=True)
 class UiEvent:
@@ -105,6 +111,8 @@ def translate(event: ExecEvent, *, workspace=None) -> list[UiEvent]:
 
     # UNKNOWN: whatever the CLI said, still said. Text if it had any, the raw
     # payload otherwise, so a new event type is visible rather than absent.
+    if isinstance(event.raw, dict) and event.raw.get("type") in _ACCOUNT_EVENT_TYPES:
+        return []
     if event.text:
         return [UiEvent("agent_log", {"content": event.text})]
     if event.raw:

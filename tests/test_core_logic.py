@@ -267,6 +267,13 @@ def test_tool_events_keep_the_tool_name_the_ui_shows():
     assert started[0].data["tool"] == "Write"
 
 
+def test_account_rate_limit_events_never_reach_the_browser():
+    # Claude Code reports the subscription's usage and reset times as an event of
+    # its own. It describes the company account, not this run.
+    raw = {"type": "rate_limit_event", "rate_limit_info": {"status": "allowed", "resetsAt": 1}}
+    assert events.translate(ExecEvent(kind=ExecEventKind.UNKNOWN, raw=raw, text="")) == []
+
+
 def test_an_unknown_event_still_reaches_the_user():
     produced = events.translate(
         ExecEvent(kind=ExecEventKind.UNKNOWN, raw={"type": "brand.new"}, text="")

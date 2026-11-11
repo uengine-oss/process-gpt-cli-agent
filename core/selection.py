@@ -57,6 +57,16 @@ class CliSelectionError(Exception):
         super().__init__(f"{message} ({hint})" if hint else message)
 
 
+class CliNotChosenError(CliSelectionError):
+    """A chat turn named no CLI at all.
+
+    A work item inherits a CLI from the activity it belongs to, so falling
+    back to the configured default there is the designer's choice, written
+    down once. A chat message has no such origin: the default would be a
+    choice nobody made, billed to whichever account that CLI is logged into.
+    """
+
+
 @dataclass(frozen=True)
 class Selection:
     agent_id: str
@@ -104,16 +114,27 @@ def _flattened(row: dict[str, Any]) -> dict[str, Any]:
     return merged
 
 
-def resolve(row: dict[str, Any]) -> Selection:
+def resolve(row: dict[str, Any], *, require_choice: bool = False) -> Selection:
     """Decide what to run, without checking whether it is installed.
 
     Separated from :func:`require_runnable` so a caller can report *what was
     asked for* even when it is unavailable — "codex is not installed" is a
     better error than "no agent".
+
+    ``require_choice`` is for chat: a request that names no CLI raises
+    :class:`CliNotChosenError` instead of taking ``CLIAGENTS_DEFAULT_CLI``.
     """
     fields = _flattened(row)
 
-    agent_id = _first(fields, _AGENT_KEYS) or settings.default_agent_id
+    agent_id = _first(fields, _AGENT_KEYS)
+    if not agent_id:
+        if require_choice:
+            raise CliNotChosenError(
+                "no CLI agent was chosen for this request",
+                agent_id="",
+                hint=f"set metadata.agent_cli to one of: {', '.join(registry.ids())}",
+            )
+        agent_id = settings.default_agent_id
     model = _first(fields, _MODEL_KEYS) or None
 
     raw_permission = _first(fields, _PERMISSION_KEYS).lower()

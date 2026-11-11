@@ -72,6 +72,15 @@ jobs:
             '(select(.kind == "Deployment") | .spec.template.spec.containers[0].image) = strenv(IMAGE_NAME)' \
             deployments/process-gpt-cli-agent.yaml
 
+          # 채팅은 대화별 런너 Pod 가 받는다(세션 라우터가 PodTemplate 으로 만든다).
+          # 여기를 같이 갱신하지 않으면 채팅을 실제로 처리하는 파드만 옛 이미지로 남고,
+          # 그 사실이 Deployment 롤아웃에는 드러나지 않는다(deepagents 때 겪은 일).
+          if [ -f deployments/agent-runner-templates.yaml ]; then
+            yq eval -i \
+              '(select(.kind == "PodTemplate" and .metadata.name == "agent-runner-cliagents") | .template.spec.containers[0].image) = strenv(IMAGE_NAME)' \
+              deployments/agent-runner-templates.yaml
+          fi
+
       - name: Commit and push GitOps change
         env:
           GITOPS_PAT: ${{ secrets.GITOPS_PAT }}
@@ -80,7 +89,7 @@ jobs:
           git remote set-url origin "https://x-access-token:${GITOPS_PAT}@github.com/uengine-oss/process-gpt-k8s.git"
           git config user.email "action@github.com"
           git config user.name "GitHub Action"
-          git add deployments/process-gpt-cli-agent.yaml
+          git add deployments/process-gpt-cli-agent.yaml deployments/agent-runner-templates.yaml
           if git diff --cached --quiet; then
             echo "GitOps manifest already points to this image"
           else
