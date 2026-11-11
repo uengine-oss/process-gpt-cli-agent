@@ -39,7 +39,7 @@ from core.journal import Journal
 from core.outcome import interpret
 from core.runner import ConcurrencyLimit, RunTimeoutError, astream
 from core.runtime import RuntimeLease
-from core.selection import CliNotChosenError, CliSelectionError, require_runnable, resolve
+from core.selection import CliNotChosenError, CliSelectionError, chat_choice, require_runnable, resolve
 from core.settings import settings
 from core.stream_registry import registry as stream_registry
 from core.workspace import Workspace, for_run
@@ -180,8 +180,15 @@ class CliAgentExecutor(AgentExecutor):
 
         # A chat names its CLI in the request (`metadata.agent_cli`) or not at
         # all; the configured default is a work-item fallback, not a chat one.
+        #
+        # A chat request is written by whoever is chatting, so it may choose the
+        # CLI and model but not the permission: `command_exec` gives the CLI a
+        # shell, and the shell inherits this pod's environment. Chat runs at the
+        # configured default permission; widening it is the work item designer's
+        # call (the activity definition), not the chat user's.
         selection = resolve(
-            {"agent_config": declared.agent_config, **row, **extras}, require_choice=chat
+            {"agent_config": declared.agent_config, **row, **(chat_choice(extras) if chat else extras)},
+            require_choice=chat,
         )
         provider = require_runnable(selection)
         message = context.get_user_input() if chat else ""

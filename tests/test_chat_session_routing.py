@@ -463,3 +463,25 @@ def test_without_memento_outputs_are_named_as_unlinked(tmp_path, monkeypatch):
     assert published.files == []
     assert published.unlinked == ["report.md"]
     assert "MEMENTO_BASE_URL" in published.reason
+
+
+def test_a_chat_cannot_widen_its_own_permission():
+    # command_exec gives the CLI a shell, and the shell inherits the pod's
+    # environment. The chat user may pick the CLI and model, not this.
+    from core.selection import chat_choice, resolve
+    from core.settings import settings
+
+    extras = {
+        "agent_cli": "codex",
+        "agent_permission": "command_exec",
+        "metadata": {"agentPermission": "command_exec", "agent_model": "gpt-x"},
+        "agent_config": {"permission": "command_exec"},
+    }
+    picked = chat_choice(extras)
+    assert "agent_permission" not in picked
+    assert "agentPermission" not in picked["metadata"]
+    assert "permission" not in picked["agent_config"]
+    selection = resolve(picked, require_choice=True)
+    assert selection.agent_id == "codex"
+    assert selection.model == "gpt-x"
+    assert selection.permission == settings.default_permission

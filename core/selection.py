@@ -178,3 +178,22 @@ def require_runnable(selection: Selection):
         ) from exc
 
     return provider
+
+
+def chat_choice(extras: dict[str, Any]) -> dict[str, Any]:
+    """What a chat request may choose: the CLI and the model, never the permission.
+
+    The permission keys are dropped at every level the resolver reads
+    (top level, and the nested ``agent_config`` / ``agentConfig`` / ``settings`` /
+    ``metadata`` blobs), so a chat runs at ``CLIAGENTS_DEFAULT_PERMISSION``.
+    """
+    def strip(blob: Any) -> Any:
+        if not isinstance(blob, dict):
+            return blob
+        out = {k: v for k, v in blob.items() if k not in _PERMISSION_KEYS}
+        for key in ("agent_config", "agentConfig", "settings", "metadata"):
+            if key in out:
+                out[key] = strip(out[key])
+        return out
+
+    return strip(dict(extras or {}))
