@@ -103,10 +103,29 @@ last four characters. The function is executable by `service_role` only.
 
 **Precedence, per run:**
 
-| Tenant key | Claude Code is started with | Codex is started with |
+| Tenant key | Work item | Chat turn |
 | --- | --- | --- |
-| set | `ANTHROPIC_API_KEY=<key>`; the pod's `CLAUDE_CODE_OAUTH_TOKEN` and `ANTHROPIC_AUTH_TOKEN` are **removed** from that run's environment | `CODEX_API_KEY` and `OPENAI_API_KEY` = `<key>` |
-| not set, or unreadable | the pod's environment, unchanged | the pod's environment, unchanged |
+| set | runs on the key (below) | runs on the key (below) |
+| not set — or no function in the database yet | the pod's environment, unchanged, plus a timeline line | **refused**: SSE `error`, `code: "company_key_required"` — nothing starts, nothing is archived |
+| lookup failed (transient) | the pod's environment, unchanged, plus a timeline line | **refused**: SSE `error`, `code: "company_key_check_failed"` («잠시 뒤 다시») |
+| not set, with `CLIAGENTS_CHAT_ALLOW_POD_CREDENTIALS=true` | as above | the pod's environment, unchanged — the old fallback |
+
+Running on the key means:
+
+| CLI | Started with |
+| --- | --- |
+| Claude Code | `ANTHROPIC_API_KEY=<key>`; the pod's `CLAUDE_CODE_OAUTH_TOKEN` and `ANTHROPIC_AUTH_TOKEN` are **removed** from that run's environment |
+| Codex | `CODEX_API_KEY` and `OPENAI_API_KEY` = `<key>` |
+
+Why chat and work items differ: the screen offers CLI chat because the company
+set a key, so a chat that quietly ran on the pod's credential — usually one
+person's subscription — would be the sharing above, unnoticed. A work item
+keeps falling back, because that is how every run worked before tenant keys
+and a stopped queue is worse. The chat refusal tells the user that an
+administrator can add the key under 설정 › CLI 에이전트 API 키; a failed lookup
+asks them to send again instead of falling back "just this once". Set
+`CLIAGENTS_CHAT_ALLOW_POD_CREDENTIALS=true` only where the pod's credential is
+itself the company's own.
 
 The pod's token is removed rather than left beside the key: with both present,
 which one is billed depends on the CLI's precedence rules (`ANTHROPIC_AUTH_TOKEN`
@@ -119,14 +138,16 @@ with an `exec_env` that drops those two variables after the merge.
 
 Without a key, the work item's timeline gets one line — 「회사 Anthropic API 키가
 설정되지 않아 이 서버의 기본 자격 증명으로 실행합니다」, or 「…확인하지 못해…」 when the
-lookup failed — and a chat turn logs it. A database without the function yet
-(production before the SQL is applied) counts as "not set" and is logged once
-per process.
+lookup failed. A database without the function yet (production before the SQL
+is applied) counts as "not set" and is logged once per process — which also
+means chat is refused there until the SQL is applied and a key is set.
 
 **Caching.** Answers, including "no key", are reused for
 `CLIAGENTS_CREDENTIAL_CACHE_SECONDS` (default 60) per tenant and provider, so a
-key saved or removed in the admin screen applies within a minute. A failed
-lookup is not cached; the next run asks again.
+key saved or removed in the admin screen applies within a minute. A chat turn
+does not trust a cached "no key" — it asks again before refusing, so a key
+just added works on the next message. A failed lookup is not cached; the next
+run asks again.
 
 **Never written down.** The key is not logged, not put in an event, the
 timeline, the journal or the session archive. The agent could still print it
@@ -146,6 +167,7 @@ and checks logs, chat events, timeline rows, workspace files and the archive.
 | `MEMENTO_BASE_URL` | download links for chat outputs (Memento's private `artifacts` bucket) |
 | `CLIAGENTS_PROCESS_POLLING` | `false` in runner Pods (default `true`) |
 | `CLIAGENTS_CREDENTIAL_CACHE_SECONDS` | how long a tenant's API key (or its absence) is reused, default `60` |
+| `CLIAGENTS_CHAT_ALLOW_POD_CREDENTIALS` | `true` lets a chat for a tenant without its own key run on the pod's credentials; default `false` refuses it |
 
 ### Gateway
 
@@ -201,7 +223,9 @@ The same keys inside `metadata.agent_config` work too. **A chat that names no
 CLI is refused** with an SSE `error` whose `code` is `cli_not_selected` and
 whose `available` lists the installed CLIs; `CLIAGENTS_DEFAULT_CLI` applies to
 work items only. A named CLI that is not installed answers `cli_unavailable`.
-Neither case runs anything in its place.
+A tenant without its own key for that CLI answers `company_key_required` (or
+`company_key_check_failed` when the key could not be read) — see
+[Tenant API keys](#tenant-api-keys). None of these runs anything in its place.
 
 **Outputs.** Only files in the turn's `outputs/` directory are deliverables
 (the agent is told so). They are collected after the turn, stored in Memento's

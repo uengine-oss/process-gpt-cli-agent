@@ -140,6 +140,12 @@ class CliAgentExecutor(AgentExecutor):
                 ),
             )
             raise
+        except credentials.CompanyKeyRequiredError as exc:
+            # Refused before anything was provisioned or started: nothing ran,
+            # so nothing new to keep. Said on the stream with a code the
+            # screen can act on (send the user to the admin, or retry).
+            archive = False
+            await self._chat_error(context, code=exc.code, text=exc.text, agent_id=exc.agent_id)
         except RunTimeoutError as exc:
             await self._fail(
                 event_queue,
@@ -192,6 +198,27 @@ class CliAgentExecutor(AgentExecutor):
         )
         provider = require_runnable(selection)
         message = context.get_user_input() if chat else ""
+
+        # --- whose account ----------------------------------------------
+        # The tenant's own API key when its administrator set one, read per
+        # run. It goes into this run's CLI environment only (``bind``), never
+        # into ``runtime_env`` or ``os.environ``. Read before anything is
+        # provisioned, because a chat without one stops here: it must not
+        # fall back to the pod's credentials (``require_company_key``). A
+        # chat also re-asks rather than trust a cached "no key" — refusing
+        # someone whose administrator just added it would be wrong.
+        run_credentials = await asyncio.to_thread(
+            credentials.for_run,
+            selection.agent_id,
+            str(row.get("tenant_id") or extras.get("tenant_id") or ""),
+            recheck_misses=chat,
+        )
+        if chat:
+            credentials.require_company_key(
+                run_credentials,
+                cli_name=provider.display_name,
+                allow_pod_credentials=settings.chat_allow_pod_credentials,
+            )
 
         await self._started(
             event_queue,
@@ -256,16 +283,8 @@ class CliAgentExecutor(AgentExecutor):
         # deployment API keys are retained.
         runtime_env = bridge.runtime_env(provider, workspace.path)
 
-        # --- whose account ----------------------------------------------
-        # The tenant's own API key when its administrator set one, read per
-        # run. It goes into this run's CLI environment only (``bind``), never
-        # into ``runtime_env`` or ``os.environ``. Without one, the pod's
-        # credentials as before — and the record says which.
-        run_credentials = await asyncio.to_thread(
-            credentials.for_run,
-            selection.agent_id,
-            str(row.get("tenant_id") or extras.get("tenant_id") or ""),
-        )
+        # A work item without a key (or a chat the install lets fall back)
+        # runs on the pod's credentials as before — and the record says so.
         if not run_credentials.tenant_key:
             await self._note(
                 event_queue,

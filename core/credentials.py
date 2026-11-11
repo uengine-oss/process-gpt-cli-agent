@@ -18,9 +18,12 @@ Three things this module guarantees, because each failure is quiet:
   precedence rules and their version, and billing a tenant's work to the
   shared subscription is exactly what this exists to stop. So the competing
   variables are removed from that run's environment.
-* **No key means today's behaviour.** A tenant that has not set one — or a
-  database that does not have the function yet — runs on the pod's
-  credentials, and the run's record says so.
+* **No key means the pod's credentials only where that is allowed.** A work
+  item for a tenant without a key — or on a database that does not have the
+  function yet — runs on the pod's credentials as before, and its record says
+  so. A chat turn does not: the screen offers CLI chat because a company key
+  exists, and a turn that quietly ran on the pod's subscription instead is the
+  sharing this module exists to stop (:func:`require_company_key`).
 
 The key is never written anywhere by this service: not to a log, an event, the
 timeline or the session archive. :func:`redact` and :func:`scrub_workspace`
@@ -256,12 +259,18 @@ def lookup(
     provider: str,
     *,
     clock: Callable[[], float] = time.monotonic,
+    recheck_misses: bool = False,
 ) -> str | None:
     """A tenant's key for ``provider``, or None. Cached for a short while.
 
     Misses are cached too: a tenant without a key would otherwise cost a round
     trip on every run. A key saved or removed in the admin screen therefore
     takes effect within ``CLIAGENTS_CREDENTIAL_CACHE_SECONDS``.
+
+    ``recheck_misses`` asks again instead of trusting a cached miss. Chat
+    refuses a turn without a key, and "add the key" is the wrong answer to
+    someone whose administrator added it thirty seconds ago. A cached key is
+    still used as is.
 
     A store that does not exist yet is a cached miss, logged once per process.
     Any other failure is not cached — the next run asks again. Both raise
@@ -272,7 +281,7 @@ def lookup(
     now = clock()
     with _cache_lock:
         hit = _cache.get(key)
-    if hit is not None and hit[0] > now:
+    if hit is not None and hit[0] > now and not (recheck_misses and not isinstance(hit[1], str)):
         if hit[1] is _UNAVAILABLE:
             raise KeyLookupError("unavailable")
         return hit[1]  # type: ignore[return-value]
@@ -309,12 +318,13 @@ def lookup(
     return value
 
 
-def for_run(agent_id: str, tenant_id: str) -> RunCredentials:
+def for_run(agent_id: str, tenant_id: str, *, recheck_misses: bool = False) -> RunCredentials:
     """The credentials a run of ``agent_id`` for ``tenant_id`` starts with.
 
     Blocking (a database round trip on a cache miss); call it off the loop.
-    Never raises: every failure means "the pod's credentials", stated in
-    ``reason``.
+    Never raises: every failure means "no tenant key", stated in ``reason`` —
+    whether that then means the pod's credentials or no run at all is the
+    caller's decision (:func:`require_company_key`).
     """
     tenant_id = (tenant_id or "").strip()
     plan = _PLANS.get(agent_id)
@@ -327,7 +337,7 @@ def for_run(agent_id: str, tenant_id: str) -> RunCredentials:
         return dataclasses.replace(base, reason="no_tenant")
 
     try:
-        secret = lookup(tenant_id, plan.provider)
+        secret = lookup(tenant_id, plan.provider, recheck_misses=recheck_misses)
     except KeyLookupError as exc:
         return dataclasses.replace(base, reason=exc.reason)
     if not secret:
@@ -337,6 +347,70 @@ def for_run(agent_id: str, tenant_id: str) -> RunCredentials:
         base,
         env={name: secret for name in plan.variables},
         unset=frozenset(plan.replaces),
+    )
+
+
+# -- chat: a company key or nothing ---------------------------------------------
+
+
+class CompanyKeyRequiredError(Exception):
+    """A chat turn that would have run on the pod's credentials, refused.
+
+    ``code`` is what the chat screen acts on; ``text`` is what it shows.
+    """
+
+    def __init__(self, text: str, *, code: str, reason: str, agent_id: str) -> None:
+        super().__init__(text)
+        self.text = text
+        self.code = code
+        self.reason = reason
+        self.agent_id = agent_id
+
+
+#: Where an administrator adds the key — the admin screen's own wording.
+_SETTINGS_PATH = "설정 › CLI 에이전트 API 키"
+
+
+def require_company_key(
+    creds: RunCredentials, *, cli_name: str, allow_pod_credentials: bool
+) -> None:
+    """Refuse a chat turn that has no company key, unless the install allows it.
+
+    The pod's credential is typically one person's subscription token. A work
+    item falls back to it — that is how every run worked before tenant keys,
+    and a queue that stops is worse. A chat does not: the screen offers CLI
+    chat because the company set a key, so running the turn on someone's
+    personal subscription instead is the sharing the licence forbids, and
+    nobody would notice. ``CLIAGENTS_CHAT_ALLOW_POD_CREDENTIALS`` restores the
+    fallback for installs where the pod's credential is the company's own.
+
+    A lookup that failed is refused too, not run on the pod "just this once":
+    the company may well have a key, and the user can simply send again.
+    """
+    if creds.tenant_key or allow_pod_credentials:
+        return
+    fallback = "공용 자격 증명으로 대신 실행하지 않습니다."
+    if creds.reason == "lookup_failed":
+        raise CompanyKeyRequiredError(
+            f"회사 API 키를 확인하지 못했습니다. 잠시 뒤 다시 보내 주세요. {fallback}",
+            code="company_key_check_failed",
+            reason=creds.reason,
+            agent_id=creds.agent_id,
+        )
+    if creds.reason == "unsupported":
+        text = (
+            f"{cli_name} 는 회사 API 키로 실행할 수 없어 채팅에서 실행하지 않았습니다. {fallback}"
+        )
+    else:
+        # not_set, unavailable (the store is not there yet), no_tenant: for
+        # the person chatting these are one situation with one remedy.
+        text = (
+            f"회사 {creds.label} API 키가 등록되어 있지 않아 {cli_name} 를 실행하지 않았습니다. "
+            f"관리자가 {_SETTINGS_PATH}에서 {cli_name} 용 회사 API 키({creds.label})를 "
+            f"등록하면 사용할 수 있습니다. {fallback}"
+        )
+    raise CompanyKeyRequiredError(
+        text, code="company_key_required", reason=creds.reason, agent_id=creds.agent_id
     )
 
 

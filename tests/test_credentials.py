@@ -549,3 +549,209 @@ def test_a_work_item_without_a_key_says_so_once_and_runs_on_the_pod(tmp_path, mo
     rows = [r for r in _status_texts(queue) if "기본 자격 증명" in r]
     assert len(rows) == 1 and "task_working" in rows[0]
     assert any("기본 자격 증명" in r.getMessage() for r in caplog.records)
+
+
+# --- chat: a company key or no turn -----------------------------------------------
+#
+# The screen offers CLI chat because the company set a key. A turn that then
+# ran on the pod's credential — one person's subscription — is the sharing the
+# licence forbids, and nobody would see it happen. Work items keep falling
+# back (see above); chat refuses unless the install says otherwise.
+
+
+def _creds(reason: str, **kwargs) -> credentials.RunCredentials:
+    return credentials.RunCredentials(
+        agent_id="claude-code",
+        tenant_id="acme",
+        provider="anthropic",
+        label="Anthropic",
+        reason=reason,
+        **kwargs,
+    )
+
+
+@pytest.mark.parametrize("reason", ["not_set", "unavailable", "no_tenant"])
+def test_a_chat_without_a_company_key_is_refused_with_the_way_to_fix_it(reason):
+    with pytest.raises(credentials.CompanyKeyRequiredError) as caught:
+        credentials.require_company_key(
+            _creds(reason), cli_name="Claude Code", allow_pod_credentials=False
+        )
+    refusal = caught.value
+    assert (refusal.code, refusal.reason, refusal.agent_id) == (
+        "company_key_required",
+        reason,
+        "claude-code",
+    )
+    assert "설정 › CLI 에이전트 API 키" in refusal.text
+    assert "Claude Code" in refusal.text and "Anthropic" in refusal.text
+    assert "대신 실행하지 않습니다" in refusal.text
+
+
+def test_a_chat_whose_key_could_not_be_checked_is_refused_not_run_on_the_pod():
+    with pytest.raises(credentials.CompanyKeyRequiredError) as caught:
+        credentials.require_company_key(
+            _creds("lookup_failed"), cli_name="Codex", allow_pod_credentials=False
+        )
+    assert caught.value.code == "company_key_check_failed"
+    assert "확인하지 못했습니다" in caught.value.text and "잠시 뒤" in caught.value.text
+    # Not "ask your administrator": the company may well have a key.
+    assert "관리자" not in caught.value.text
+
+
+def test_a_cli_without_company_keys_is_refused_in_chat():
+    creds = credentials.RunCredentials(agent_id="gemini", tenant_id="acme", reason="unsupported")
+    with pytest.raises(credentials.CompanyKeyRequiredError) as caught:
+        credentials.require_company_key(creds, cli_name="Gemini", allow_pod_credentials=False)
+    assert caught.value.code == "company_key_required"
+
+
+@pytest.mark.parametrize(
+    "reason", ["not_set", "unavailable", "lookup_failed", "no_tenant", "unsupported"]
+)
+def test_an_install_can_allow_the_old_fallback(reason):
+    credentials.require_company_key(
+        _creds(reason), cli_name="Claude Code", allow_pod_credentials=True
+    )
+
+
+def test_a_chat_with_a_company_key_is_never_refused():
+    credentials.require_company_key(
+        _creds("", env={"ANTHROPIC_API_KEY": KEY}),
+        cli_name="Claude Code",
+        allow_pod_credentials=False,
+    )
+
+
+def test_the_fallback_is_off_unless_turned_on(monkeypatch):
+    from core.settings import Settings
+
+    monkeypatch.delenv("CLIAGENTS_CHAT_ALLOW_POD_CREDENTIALS", raising=False)
+    assert Settings().chat_allow_pod_credentials is False
+    monkeypatch.setenv("CLIAGENTS_CHAT_ALLOW_POD_CREDENTIALS", "true")
+    assert Settings().chat_allow_pod_credentials is True
+
+
+def test_chat_rechecks_a_cached_miss_but_trusts_a_cached_key(monkeypatch):
+    """Refusing someone whose administrator added the key a moment ago, from
+    a 60-second-old "no key", would send them to fix what is already fixed."""
+    answers = {"acme": None}
+    calls = _stub_rpc(monkeypatch, lambda tenant, _p: answers[tenant])
+
+    assert credentials.for_run("claude-code", "acme").reason == "not_set"
+    answers["acme"] = KEY  # the administrator saves the key
+    # A work item may keep the cached miss for a minute...
+    assert credentials.for_run("claude-code", "acme").reason == "not_set"
+    assert len(calls) == 1
+    # ...a chat asks again, and the answer is cached for the next turn.
+    assert credentials.for_run("claude-code", "acme", recheck_misses=True).tenant_key
+    assert credentials.for_run("claude-code", "acme", recheck_misses=True).tenant_key
+    assert len(calls) == 2
+
+
+def _chat_turn(tmp_path, monkeypatch, *, cli: str = "claude-code"):
+    """One chat turn through the executor, with the real runner and a fake
+    CLI process. Returns (stream events, processes started, archive saves)."""
+    from processgpt_agent_sdk import ChatEventQueue, ChatRequest, ChatRequestContext
+    from processgpt_agent_sdk.chat_mode import ChatStreamer
+    from processgpt_agent_sdk.chat_registry import RunRecordingQueue
+
+    import executor as ex
+    from core import chat_session
+    from core import workspace as workspace_module
+    from core.settings import settings
+
+    monkeypatch.setattr(
+        workspace_module, "settings", dataclasses.replace(settings, workspace_root=tmp_path)
+    )
+    started = _real_runner_with_fake_cli(monkeypatch)
+    saves: list[str] = []
+
+    async def _restore(*_a, **_k):
+        return 0
+
+    async def _save(workspace, **_k):
+        saves.append(str(workspace.path))
+        return 0
+
+    monkeypatch.setattr(chat_session, "restore", _restore)
+    monkeypatch.setattr(chat_session, "save", _save)
+
+    request = ChatRequest(
+        message="안녕", tenant_id="acme", conversation_id="conv-1", metadata={"agent_cli": cli}
+    )
+    out: asyncio.Queue = RunRecordingQueue("conv-1")
+    context = ChatRequestContext(request, streamer=ChatStreamer(out))
+    asyncio.run(ex.CliAgentExecutor().execute(context, ChatEventQueue(out, request=request)))
+
+    events = []
+    while not out.empty():
+        item = out.get_nowait()
+        if item.get("event") == "message":
+            events.append(item["data"])
+    return events, started, saves
+
+
+@pytest.mark.parametrize(
+    "answer, code",
+    [
+        (None, "company_key_required"),
+        (credentials._StoreUnavailableError("PGRST202"), "company_key_required"),
+        (APIError({"code": "57014", "message": "statement timeout"}), "company_key_check_failed"),
+    ],
+    ids=["not_set", "unavailable", "lookup_failed"],
+)
+def test_a_chat_turn_without_a_company_key_starts_no_cli_and_keeps_nothing(
+    tmp_path, monkeypatch, answer, code
+):
+    _stub_rpc(monkeypatch, answer)
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", POD_TOKEN)
+
+    events, started, saves = _chat_turn(tmp_path, monkeypatch)
+
+    assert started == []  # no CLI process, on any credential
+    assert [e["type"] for e in events] == ["error"]
+    assert events[0]["code"] == code
+    assert events[0]["agent"] == "claude-code"
+    assert saves == []  # nothing ran, nothing archived
+    # Refused before provisioning: no skills, agents or settings written.
+    assert [p for p in tmp_path.rglob("*") if p.is_file()] == []
+
+
+def test_a_codex_chat_names_the_openai_key_it_needs(tmp_path, monkeypatch):
+    _stub_rpc(monkeypatch, None)
+    events, started, _saves = _chat_turn(tmp_path, monkeypatch, cli="codex")
+    assert started == []
+    assert events[0]["code"] == "company_key_required"
+    assert "OpenAI" in events[0]["content"] and "Codex" in events[0]["content"]
+
+
+def test_an_install_that_allows_it_runs_the_chat_on_the_pod(tmp_path, monkeypatch):
+    import executor as ex
+    from core.settings import settings
+
+    monkeypatch.setattr(
+        ex, "settings", dataclasses.replace(settings, chat_allow_pod_credentials=True)
+    )
+    _stub_rpc(monkeypatch, None)
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", POD_TOKEN)
+
+    events, started, saves = _chat_turn(tmp_path, monkeypatch)
+
+    [run] = started
+    assert run["env"]["CLAUDE_CODE_OAUTH_TOKEN"] == POD_TOKEN
+    assert "ANTHROPIC_API_KEY" not in run["env"]
+    assert events[-1]["type"] == "done"
+    assert len(saves) == 1
+
+
+def test_a_chat_with_a_company_key_runs_on_it(tmp_path, monkeypatch):
+    _stub_rpc(monkeypatch, KEY)
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", POD_TOKEN)
+
+    events, started, saves = _chat_turn(tmp_path, monkeypatch)
+
+    [run] = started
+    assert run["env"]["ANTHROPIC_API_KEY"] == KEY
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in run["env"]
+    assert events[-1]["type"] == "done"
+    assert len(saves) == 1
