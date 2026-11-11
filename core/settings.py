@@ -113,6 +113,13 @@ class Settings:
         default_factory=lambda: (os.getenv("MEMENTO_BASE_URL") or "").strip().rstrip("/")
     )
 
+    #: How long a tenant's API key — or the fact that it has none — is reused
+    #: before the database is asked again (``core.credentials``). Also how
+    #: long a key saved or removed in the admin screen takes to apply.
+    credential_cache_seconds: int = field(
+        default_factory=lambda: _env_int("CLIAGENTS_CREDENTIAL_CACHE_SECONDS", 60)
+    )
+
     @property
     def retention_seconds(self) -> int:
         return self.workspace_retention_hours * 3600

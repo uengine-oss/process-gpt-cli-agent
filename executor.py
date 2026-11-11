@@ -30,7 +30,7 @@ from processgpt_agent_sdk import emit_chunk_json, is_chat_request
 from processgpt_agent_sdk.artifacts import strip_local_paths
 from typing_extensions import override
 
-from core import activity, bridge, chat_session, hitl, resume, skills, subagents
+from core import activity, bridge, chat_session, credentials, hitl, resume, skills, subagents
 from core import events as ui_events
 from core import timeline
 from core import prompt as prompt_builder
@@ -256,6 +256,26 @@ class CliAgentExecutor(AgentExecutor):
         # deployment API keys are retained.
         runtime_env = bridge.runtime_env(provider, workspace.path)
 
+        # --- whose account ----------------------------------------------
+        # The tenant's own API key when its administrator set one, read per
+        # run. It goes into this run's CLI environment only (``bind``), never
+        # into ``runtime_env`` or ``os.environ``. Without one, the pod's
+        # credentials as before — and the record says which.
+        run_credentials = await asyncio.to_thread(
+            credentials.for_run,
+            selection.agent_id,
+            str(row.get("tenant_id") or extras.get("tenant_id") or ""),
+        )
+        if not run_credentials.tenant_key:
+            await self._note(
+                event_queue,
+                task_id=task_id,
+                context_id=context_id,
+                text=run_credentials.describe(),
+            )
+        else:
+            logger.info("run %s: %s", task_id or context_id, run_credentials.describe())
+
         # --- what the agent is asked ------------------------------------
         if chat:
             # The user's words, on the session this conversation is already
@@ -299,7 +319,7 @@ class CliAgentExecutor(AgentExecutor):
         try:
             async with limiter:
                 final_text, session_id, paused = await self._stream(
-                    provider=provider,
+                    provider=run_credentials.bind(provider),
                     request=request,
                     env=runtime_env or None,
                     context=context,
@@ -311,12 +331,20 @@ class CliAgentExecutor(AgentExecutor):
                     record=not chat,
                     chat=chat,
                     errors=cli_errors,
+                    secrets=run_credentials.secrets,
                 )
         finally:
             # Whatever happened next — paused, stored, failed, stopped — this
             # stream is over, and a listener waiting on it should be released
             # rather than left hanging until its own timeout.
             stream_registry.finish(workspace.run_id)
+            if run_credentials.secrets:
+                # The CLI has exited. Before its transcript is archived or a
+                # file is published or downloaded, take out any copy of the
+                # key the agent printed (an `env` in a shell, say).
+                await asyncio.to_thread(
+                    credentials.scrub_workspace, workspace.path, run_credentials.secrets
+                )
 
         outcome = interpret(final_text, extras.get("form_fields"))
         if hitl.should_pause(refused=paused is not None, final_text=final_text, contract_met=outcome.contract_met):
@@ -414,6 +442,7 @@ class CliAgentExecutor(AgentExecutor):
         record: bool = True,
         chat: bool = False,
         errors: list[str] | None = None,
+        secrets: tuple[str, ...] = (),
     ) -> tuple[str, str | None, str | None]:
         """Forward progress to the UI. Returns (final text, session, pause).
 
@@ -425,6 +454,10 @@ class CliAgentExecutor(AgentExecutor):
         is what the chat screen draws as the answer, and what the SDK keeps
         for the snapshot a reattaching client (``/chat/stream/attach``) gets
         first. Sent as anything else, a reattach shows an empty answer.
+
+        ``secrets`` (the tenant's API key, when the run has one) are replaced
+        in every event before anything reads it — the stream, the timeline,
+        the journal, the failure text all start here.
         """
         final_text = ""
         session_id: str | None = None
@@ -443,6 +476,7 @@ class CliAgentExecutor(AgentExecutor):
         async for event in astream(
             provider, request, env=env, timeout=settings.run_timeout_seconds
         ):
+            event = credentials.redact(event, secrets)
             if event.session_id:
                 if event.session_id != session_id:
                     # Saved now, not at completion: a run killed halfway is the
@@ -777,6 +811,27 @@ class CliAgentExecutor(AgentExecutor):
         await emit_chunk_json(context, {"type": "notice", "content": text})
         # `notice` is not in the store's event_type enum — those rows were
         # rejected. `task_working` is, and the card lists it with `query`.
+        await self._status(
+            event_queue,
+            task_id=task_id,
+            context_id=context_id,
+            state=TaskState.TASK_STATE_WORKING,
+            text=json.dumps({"query": text, "info": text}, ensure_ascii=False),
+            event_type="task_working",
+            crew_type=timeline.CREW_TYPE,
+        )
+
+    async def _note(
+        self, event_queue: EventQueue, *, task_id: str, context_id: str, text: str
+    ) -> None:
+        """A line on the run's record that is not a problem.
+
+        Unlike ``_notice``: no warning in the log and nothing on the chat
+        stream — the chat screen does not draw notices, and this is not a
+        degradation the user has to act on. A chat queue drops status events,
+        so in chat this is the log line alone.
+        """
+        logger.info("run %s: %s", task_id or context_id, text)
         await self._status(
             event_queue,
             task_id=task_id,
