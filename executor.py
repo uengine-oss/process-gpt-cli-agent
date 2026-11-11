@@ -27,17 +27,19 @@ from a2a.types import TaskState
 from cliagents import ArtifactKind, ExecEventKind
 from google.protobuf.json_format import ParseDict
 from processgpt_agent_sdk import emit_chunk_json, is_chat_request
+from processgpt_agent_sdk.artifacts import strip_local_paths
 from typing_extensions import override
 
-from core import activity, bridge, hitl, resume, skills, subagents
+from core import activity, bridge, chat_session, hitl, resume, skills, subagents
 from core import events as ui_events
 from core import timeline
 from core import prompt as prompt_builder
+from core.availability import snapshot as cli_snapshot
 from core.journal import Journal
 from core.outcome import interpret
 from core.runner import ConcurrencyLimit, RunTimeoutError, astream
 from core.runtime import RuntimeLease
-from core.selection import CliSelectionError, require_runnable, resolve
+from core.selection import CliNotChosenError, CliSelectionError, chat_choice, require_runnable, resolve
 from core.settings import settings
 from core.stream_registry import registry as stream_registry
 from core.workspace import Workspace, for_run
@@ -47,6 +49,17 @@ logger = logging.getLogger(__name__)
 #: Shared across every run in this process, so the cap is a property of the
 #: container rather than of one work item.
 limiter = ConcurrencyLimit(settings.max_concurrent_runs)
+
+#: Runs this process is executing — chat turns and work items alike, from the
+#: first line of ``execute`` to the last byte archived. Wider than the
+#: limiter, which only counts live CLI processes: a Pod still uploading a
+#: finished turn's session is not idle either.
+_active_runs = 0
+
+
+def active_runs() -> int:
+    """How many runs are in progress here. ``/health`` reports busy on it."""
+    return _active_runs
 
 #: The timeline card this run writes to (``timeline.job_id``). A context
 #: variable, not an attribute: one executor serves concurrent runs.
@@ -58,6 +71,14 @@ class CliAgentExecutor(AgentExecutor):
 
     @override
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
+        global _active_runs
+        _active_runs += 1
+        try:
+            await self._execute(context, event_queue)
+        finally:
+            _active_runs -= 1
+
+    async def _execute(self, context: RequestContext, event_queue: EventQueue) -> None:
         row: dict[str, Any] = dict(getattr(context, "row", {}) or {})
         extras: dict[str, Any] = dict(getattr(context, "metadata", {}) or {})
         task_id = str(context.task_id or "")
@@ -65,10 +86,26 @@ class CliAgentExecutor(AgentExecutor):
         chat = is_chat_request(context)
         _JOB_ID.set(timeline.job_id(task_id, row))
 
+        if chat and not context.get_user_input().strip():
+            await self._chat_error(
+                context,
+                code="empty_message",
+                text="보낼 메시지가 비어 있어 CLI 에이전트를 실행하지 않았습니다.",
+                agent_id="",
+            )
+            return
+
         run_id = task_id or context_id or "run"
         tenant_id = str(row.get("tenant_id") or extras.get("tenant_id") or "")
         workspace = for_run(run_id, tenant_id=tenant_id)
         runtime_lease = RuntimeLease(workspace.path)
+
+        # A chat's workspace is the conversation's, and this Pod may be a new
+        # one. Restore before anything writes here: a directory that already
+        # holds files is taken to be current and is not restored.
+        archive = chat
+        if chat:
+            await chat_session.restore(workspace, tenant_id=tenant_id, conversation_id=context_id)
 
         try:
             await self._run(
@@ -83,6 +120,14 @@ class CliAgentExecutor(AgentExecutor):
                 runtime_lease=runtime_lease,
             )
         except CliSelectionError as exc:
+            # Nothing ran, so there is nothing new to keep.
+            archive = False
+            if chat:
+                # The chat stream ignores status events, so `_fail` would end
+                # the turn in silence. Say it on the stream, with a code the
+                # screen can act on, and end the turn there.
+                await self._refuse_chat(context, exc)
+                return
             # Never substitute another agent: the work item named one, and
             # running a different one produces work under a name nobody chose.
             await self._fail(
@@ -108,6 +153,11 @@ class CliAgentExecutor(AgentExecutor):
             # Restore/remove every managed runtime file after every attempt;
             # sessions and business artifacts are deliberately not managed.
             runtime_lease.restore()
+            # After the lease, so what is archived is the conversation and not
+            # this turn's provisioning. Also after a stop or a timeout: the
+            # next turn should continue from where this one was cut off.
+            if archive:
+                await chat_session.save(workspace, tenant_id=tenant_id, conversation_id=context_id)
 
     async def _run(
         self,
@@ -128,8 +178,20 @@ class CliAgentExecutor(AgentExecutor):
         # item deliberately should beat one inherited from the definition.
         declared = await asyncio.to_thread(activity.for_work_item, row)
 
-        selection = resolve({"agent_config": declared.agent_config, **row, **extras})
+        # A chat names its CLI in the request (`metadata.agent_cli`) or not at
+        # all; the configured default is a work-item fallback, not a chat one.
+        #
+        # A chat request is written by whoever is chatting, so it may choose the
+        # CLI and model but not the permission: `command_exec` gives the CLI a
+        # shell, and the shell inherits this pod's environment. Chat runs at the
+        # configured default permission; widening it is the work item designer's
+        # call (the activity definition), not the chat user's.
+        selection = resolve(
+            {"agent_config": declared.agent_config, **row, **(chat_choice(extras) if chat else extras)},
+            require_choice=chat,
+        )
         provider = require_runnable(selection)
+        message = context.get_user_input() if chat else ""
 
         await self._started(
             event_queue,
@@ -161,7 +223,7 @@ class CliAgentExecutor(AgentExecutor):
         # --- what the agent can read -----------------------------------
         bundle, skill_failures = skills.build_bundle(
             instructions=(
-                _instructions(row, extras, workspace)
+                _instructions(row, extras, workspace, chat=chat)
                 + "\n\n"
                 + subagents.delegation_instructions(runtime_agents)
             ),
@@ -195,16 +257,21 @@ class CliAgentExecutor(AgentExecutor):
         runtime_env = bridge.runtime_env(provider, workspace.path)
 
         # --- what the agent is asked ------------------------------------
-        # Why this run is starting (SDK: new / crash reclaim / human answer /
-        # revision) picks the prompt and the session to continue.
-        start = resume.plan_start(
-            workspace.path,
-            row=row,
-            extras=extras,
-            workspace_exists=workspace.exists,
-            fresh_prompt=lambda: prompt_builder.build(row, extras, workdir=str(workspace.path)),
-            previous_summary=str(row.get("draft") or "")[:2000],
-        )
+        if chat:
+            # The user's words, on the session this conversation is already
+            # on — which a restored archive brings back on a fresh Pod.
+            start = resume.plan_chat(workspace.path, message, agent_id=selection.agent_id)
+        else:
+            # Why this run is starting (SDK: new / crash reclaim / human
+            # answer / revision) picks the prompt and the session to continue.
+            start = resume.plan_start(
+                workspace.path,
+                row=row,
+                extras=extras,
+                workspace_exists=workspace.exists,
+                fresh_prompt=lambda: prompt_builder.build(row, extras, workdir=str(workspace.path)),
+                previous_summary=str(row.get("draft") or "")[:2000],
+            )
         text = start.prompt
         resume_session = start.session_id
         if start.notice:
@@ -221,27 +288,35 @@ class CliAgentExecutor(AgentExecutor):
         )
 
         # --- run --------------------------------------------------------
+        if chat:
+            # What `outputs/` held before, so only this turn's files are
+            # offered for download.
+            chat_session.outputs_dir(workspace).mkdir(exist_ok=True)
+            outputs_before = chat_session.before_turn(workspace)
+
         cli_errors: list[str] = []
         stream_registry.start(workspace.run_id)
-        async with limiter:
-            final_text, session_id, paused = await self._stream(
-                provider=provider,
-                request=request,
-                env=runtime_env or None,
-                context=context,
-                event_queue=event_queue,
-                task_id=task_id,
-                context_id=context_id,
-                workspace=workspace,
-                journal=journal,
-                record=not chat,
-                errors=cli_errors,
-            )
-
-        # Whatever happened next — paused, stored, failed — this stream is
-        # over, and a listener waiting on it should be released rather than
-        # left hanging until its own timeout.
-        stream_registry.finish(workspace.run_id)
+        try:
+            async with limiter:
+                final_text, session_id, paused = await self._stream(
+                    provider=provider,
+                    request=request,
+                    env=runtime_env or None,
+                    context=context,
+                    event_queue=event_queue,
+                    task_id=task_id,
+                    context_id=context_id,
+                    workspace=workspace,
+                    journal=journal,
+                    record=not chat,
+                    chat=chat,
+                    errors=cli_errors,
+                )
+        finally:
+            # Whatever happened next — paused, stored, failed, stopped — this
+            # stream is over, and a listener waiting on it should be released
+            # rather than left hanging until its own timeout.
+            stream_registry.finish(workspace.run_id)
 
         outcome = interpret(final_text, extras.get("form_fields"))
         if hitl.should_pause(refused=paused is not None, final_text=final_text, contract_met=outcome.contract_met):
@@ -290,6 +365,29 @@ class CliAgentExecutor(AgentExecutor):
             )
             return
 
+        files: list[dict[str, Any]] = []
+        if chat:
+            published = await chat_session.publish(
+                workspace,
+                tenant_id=str(extras.get("tenant_id") or ""),
+                conversation_id=context_id,
+                before=outputs_before,
+            )
+            files = published.files
+            if published.unlinked:
+                # Said in the answer itself: a `notice` event is not drawn by
+                # the chat screen, and "the agent made a file you cannot get"
+                # is exactly what must not pass in silence.
+                note = (
+                    "다음 산출물은 내려받기 링크를 만들지 못했습니다: "
+                    + ", ".join(published.unlinked)
+                    + (f" ({published.reason})" if published.reason else "")
+                )
+                await self._notice(
+                    context, event_queue, task_id=task_id, context_id=context_id, text=note
+                )
+                outcome.raw_text = f"{outcome.raw_text}\n\n> {note}".strip()
+
         await self._complete(
             context=context,
             event_queue=event_queue,
@@ -298,6 +396,7 @@ class CliAgentExecutor(AgentExecutor):
             outcome=outcome,
             session_id=session_id,
             journal=journal,
+            files=files,
         )
 
     async def _stream(
@@ -313,6 +412,7 @@ class CliAgentExecutor(AgentExecutor):
         workspace: Workspace,
         journal: Journal,
         record: bool = True,
+        chat: bool = False,
         errors: list[str] | None = None,
     ) -> tuple[str, str | None, str | None]:
         """Forward progress to the UI. Returns (final text, session, pause).
@@ -320,6 +420,11 @@ class CliAgentExecutor(AgentExecutor):
         Two audiences: the chat stream (SSE chunks, gone on refresh) and, for a
         work item (``record``), the stored timeline the work-item screen draws.
         CLI error messages are appended to ``errors`` for the failure text.
+
+        In ``chat``, the answer's text goes out as SDK ``token`` chunks: that
+        is what the chat screen draws as the answer, and what the SDK keeps
+        for the snapshot a reattaching client (``/chat/stream/attach``) gets
+        first. Sent as anything else, a reattach shows an empty answer.
         """
         final_text = ""
         session_id: str | None = None
@@ -342,7 +447,9 @@ class CliAgentExecutor(AgentExecutor):
                 if event.session_id != session_id:
                     # Saved now, not at completion: a run killed halfway is the
                     # one a reclaim has to continue.
-                    resume.remember_session(workspace.path, event.session_id)
+                    resume.remember_session(
+                        workspace.path, event.session_id, agent_id=getattr(provider, "id", "")
+                    )
                 session_id = event.session_id
 
             if event.kind is ExecEventKind.RESULT:
@@ -369,6 +476,8 @@ class CliAgentExecutor(AgentExecutor):
 
             for ui_event in ui_events.translate(event, workspace=workspace):
                 payload = ui_event.as_dict()
+                if chat and ui_event.type == "text":
+                    payload = {"type": "token", "content": ui_event.data.get("content", "")}
                 await emit_chunk_json(context, payload)
                 # Also to the registry: a client that reconnects mid-run
                 # replays from there rather than watching a dead spinner.
@@ -455,6 +564,7 @@ class CliAgentExecutor(AgentExecutor):
         outcome,
         session_id: str | None,
         journal: Journal,
+        files: list[dict[str, Any]] | None = None,
     ) -> None:
         payload = dict(outcome.payload)
         if session_id:
@@ -506,14 +616,25 @@ class CliAgentExecutor(AgentExecutor):
         # platform decides output-vs-draft from the item's own `agent_mode`;
         # sending False here only tells it the run is still going, so a draft
         # run stays IN_PROGRESS forever with a finished answer sitting in it.
+        text = body if outcome.outputs else outcome.raw_text
+        metadata: dict[str, Any] = {"role": "assistant"}
+        if files:
+            # `pdfFiles` is the SDK's name for a turn's downloads: it rides on
+            # `done.files` and is stored on the chat message, so the links
+            # survive a reload and the Pod that made the files.
+            metadata["pdfFiles"] = files
+            # The agent names its files by the path it saw. Point those at
+            # the links instead of at a disk the user cannot reach.
+            text = strip_local_paths(text, files)
+
         artifact = new_text_artifact_update_event(
             task_id=task_id,
             context_id=context_id,
             name="assistant_response",
-            text=body if outcome.outputs else outcome.raw_text,
+            text=text,
             last_chunk=True,
         )
-        ParseDict({"role": "assistant"}, artifact.metadata)
+        ParseDict(metadata, artifact.metadata)
         await event_queue.enqueue_event(artifact)
 
     async def _pause(
@@ -595,6 +716,53 @@ class CliAgentExecutor(AgentExecutor):
             crew_type=timeline.CREW_TYPE,
         )
 
+    async def _refuse_chat(self, context: RequestContext, exc: CliSelectionError) -> None:
+        """End a chat turn whose CLI cannot run, and say what to do about it."""
+        if isinstance(exc, CliNotChosenError):
+            await self._chat_error(
+                context,
+                code="cli_not_selected",
+                text=(
+                    "이 대화에 사용할 CLI 에이전트가 선택되지 않았습니다. "
+                    "Claude Code 나 Codex 중 하나를 골라 다시 보내 주세요. "
+                    "임의로 다른 에이전트를 대신 실행하지 않습니다."
+                ),
+                agent_id="",
+            )
+            return
+        await self._chat_error(
+            context,
+            code="cli_unavailable",
+            text=(
+                f"{exc}\n\n선택한 CLI 에이전트를 이 환경에서 실행할 수 없어 답하지 않았습니다. "
+                "다른 에이전트로 대체 실행하지 않습니다."
+            ),
+            agent_id=exc.agent_id,
+        )
+
+    async def _chat_error(
+        self, context: RequestContext, *, code: str, text: str, agent_id: str
+    ) -> None:
+        """An error event the chat screen shows, with what can run here.
+
+        ``available`` lists the CLIs installed in this deployment — the same
+        answer ``GET /agents`` gives — so the screen can offer a choice
+        instead of only a failure.
+        """
+        logger.warning("chat turn refused (%s): %s", code, text.splitlines()[0])
+        available = [a.agent_id for a in cli_snapshot(refresh=False) if a.installed]
+        await emit_chunk_json(
+            context,
+            {
+                "type": "error",
+                "code": code,
+                "error": text,
+                "content": text,
+                "agent": agent_id,
+                "available": available,
+            },
+        )
+
     async def _notice(
         self,
         context: RequestContext,
@@ -663,7 +831,9 @@ class CliAgentExecutor(AgentExecutor):
 # --- reading the work item ------------------------------------------------
 
 
-def _instructions(row: dict[str, Any], extras: dict[str, Any], workspace: Workspace) -> str:
+def _instructions(
+    row: dict[str, Any], extras: dict[str, Any], workspace: Workspace, *, chat: bool = False
+) -> str:
     """The always-on project instruction file for this run."""
     lines = [
         "# ProcessGPT 업무 에이전트",
@@ -684,6 +854,19 @@ def _instructions(row: dict[str, Any], extras: dict[str, Any], workspace: Worksp
     tenant = (row.get("tenant_id") or "").strip()
     if tenant:
         lines += [f"테넌트: {tenant}"]
+
+    if chat:
+        # The only files a chat user can download are the ones collected from
+        # here (core.chat_session). A file left anywhere else is made and then
+        # unreachable — the screen gets no link for it.
+        outputs = workspace.path / chat_session.OUTPUTS_DIR
+        lines += [
+            "",
+            "## 사용자에게 전달할 파일",
+            f"사용자가 내려받아야 하는 최종 파일은 `{outputs}/` 에 저장하세요. "
+            "이 폴더에 둔 파일만 내려받기 링크로 전달됩니다. "
+            "중간 작업 파일은 다른 곳에 두어도 됩니다.",
+        ]
 
     # A skill that generates process artifacts documents their file names but
     # not where this run's files belong — that is a per-run value only the

@@ -35,6 +35,13 @@ def _env_path(name: str, default: str) -> Path:
     return Path(os.getenv(name) or default).expanduser()
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = (os.getenv(name) or "").strip().lower()
+    if not raw:
+        return default
+    return raw not in ("false", "0", "no", "off")
+
+
 @dataclass(frozen=True)
 class Settings:
     host: str = field(default_factory=lambda: os.getenv("HOST", "0.0.0.0"))
@@ -89,6 +96,21 @@ class Settings:
     #: go through the download route instead.
     file_preview_max_bytes: int = field(
         default_factory=lambda: _env_int("CLIAGENTS_FILE_PREVIEW_MAX_BYTES", 400_000)
+    )
+
+    #: Whether this process claims work items. Off in a per-conversation chat
+    #: runner Pod: the session router reclaims an idle Pod, and a work item the
+    #: Pod had claimed would stop with it. Polling belongs to a long-lived
+    #: Deployment.
+    process_polling: bool = field(
+        default_factory=lambda: _env_bool("CLIAGENTS_PROCESS_POLLING", True)
+    )
+
+    #: Memento, which keeps chat outputs in a private bucket and hands out
+    #: signed links. Unset means chat outputs get no download link — they stay
+    #: in the session archive only, and the turn says so.
+    memento_base_url: str = field(
+        default_factory=lambda: (os.getenv("MEMENTO_BASE_URL") or "").strip().rstrip("/")
     )
 
     @property

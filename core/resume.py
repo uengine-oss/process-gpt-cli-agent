@@ -39,21 +39,51 @@ CONTINUE_PROMPT = (
 )
 
 
-def remember_session(workspace_path: Path, session_id: str) -> None:
-    if not session_id or saved_session(workspace_path) == session_id:
+def remember_session(workspace_path: Path, session_id: str, *, agent_id: str = "") -> None:
+    """Record the CLI session this workspace is on, and which CLI owns it.
+
+    The owner matters in chat, where one conversation may switch CLI between
+    turns: a Claude Code session id handed to Codex is not a session at all.
+    """
+    if not session_id:
+        return
+    record = {"session_id": session_id}
+    if agent_id:
+        record["agent_id"] = agent_id
+    if _read(workspace_path) == record:
         return
     path = workspace_path / SESSION_FILENAME
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"session_id": session_id}), encoding="utf-8")
+    path.write_text(json.dumps(record), encoding="utf-8")
 
 
-def saved_session(workspace_path: Path) -> str:
+def saved_session(workspace_path: Path, *, agent_id: str = "") -> str:
+    """The saved session id, or "" when there is none.
+
+    With ``agent_id``, a session recorded for a different CLI counts as none.
+    A record written before the owner was recorded is trusted as before.
+    """
+    data = _read(workspace_path)
+    value = data.get("session_id", "")
+    owner = data.get("agent_id", "")
+    if agent_id and owner and owner != agent_id:
+        return ""
+    return value
+
+
+def _read(workspace_path: Path) -> dict[str, str]:
     try:
         data = json.loads((workspace_path / SESSION_FILENAME).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return ""
-    value = data.get("session_id") if isinstance(data, dict) else None
-    return value.strip() if isinstance(value, str) else ""
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out: dict[str, str] = {}
+    for key in ("session_id", "agent_id"):
+        value = data.get(key)
+        if isinstance(value, str) and value.strip():
+            out[key] = value.strip()
+    return out
 
 
 @dataclass
@@ -128,6 +158,19 @@ def session_of(row: dict[str, Any], extras: dict[str, Any]) -> str | None:
         value = parsed.get("cliagents_session_id") if isinstance(parsed, dict) else None
         return value if isinstance(value, str) and value.strip() else None
     return None
+
+
+def plan_chat(workspace_path: Path, message: str, *, agent_id: str) -> StartPlan:
+    """A chat turn: the user's words verbatim, on the conversation's session.
+
+    A chat's workspace belongs to the conversation, so the session the last
+    turn saved there is this conversation's — unless that turn ran another
+    CLI, in which case this one starts its own.
+    """
+    return StartPlan(
+        prompt=message.strip(),
+        session_id=saved_session(workspace_path, agent_id=agent_id) or None,
+    )
 
 
 def plan_start(
