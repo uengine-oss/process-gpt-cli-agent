@@ -35,7 +35,7 @@ from starlette.testclient import TestClient  # noqa: E402
 
 import executor as ex  # noqa: E402
 import server as server_module  # noqa: E402
-from core import chat_session, resume, selection  # noqa: E402
+from core import chat_session, credentials, resume, selection  # noqa: E402
 from core import workspace as workspace_module  # noqa: E402
 from core.settings import Settings, settings  # noqa: E402
 from core.workspace import Workspace  # noqa: E402
@@ -182,6 +182,9 @@ def _chat(tmp_path, monkeypatch, *, metadata: dict[str, Any], message: str = "í•
         workspace_module, "settings", dataclasses.replace(settings, workspace_root=tmp_path)
     )
     monkeypatch.setattr(ex, "require_runnable", lambda chosen: registry.get(chosen.agent_id))
+    # Chat runs only on a company key (core.credentials.require_company_key);
+    # these tests are about the turn, so the tenant has one.
+    monkeypatch.setattr(credentials, "_fetch", lambda _tenant, _provider: "sk-test-company-key")
 
     calls: dict[str, int] = {"restore": 0, "save": 0}
 

@@ -120,6 +120,14 @@ class Settings:
         default_factory=lambda: _env_int("CLIAGENTS_CREDENTIAL_CACHE_SECONDS", 60)
     )
 
+    #: Whether a chat turn for a tenant without its own API key may run on
+    #: this pod's credentials. Off: the pod's credential is usually one
+    #: person's subscription token, and chat is offered because the company
+    #: set a key. Work items fall back regardless (``core.credentials``).
+    chat_allow_pod_credentials: bool = field(
+        default_factory=lambda: _env_bool("CLIAGENTS_CHAT_ALLOW_POD_CREDENTIALS", False)
+    )
+
     @property
     def retention_seconds(self) -> int:
         return self.workspace_retention_hours * 3600
