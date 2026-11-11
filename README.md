@@ -36,6 +36,7 @@ leaves only HTTP — that is how a per-conversation chat runner Pod runs (see
 | `core/prompt.py` | Work item → prompt |
 | `core/skills.py` | Skills and instructions → CLI-native project artifacts |
 | `core/bridge.py` | ProcessGPT tools → MCP registration, isolated per run |
+| `core/credentials.py` | The tenant's own API key → that run's CLI environment, and nowhere else |
 | `core/events.py` | Normalised exec events → ProcessGPT UI events |
 | `core/outcome.py` | Final text → form outputs, honestly or not at all |
 | `core/hitl.py` | Permission requests → human questions → resume |
@@ -61,8 +62,10 @@ docker push ${IMAGE_NAME}
 
 ### Credentials
 
-Each CLI authenticates itself; this service never sees a token. Two supported
-shapes, in order of preference:
+A run uses its **tenant's own API key** when the tenant's administrator has set
+one (see [Tenant API keys](#tenant-api-keys)). Otherwise each CLI authenticates
+with what the pod gives it, and this service never sees that token. Two
+supported shapes for the pod, in order of preference:
 
 1. **API keys** (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`) — injectable, rotatable,
    and they need no interactive login inside a container.
@@ -80,6 +83,59 @@ A run relocates Claude Code's config directory into its workspace
 under a name derived from that directory, so a local run does not see it —
 use `CLAUDE_CODE_OAUTH_TOKEN` or an API key there too.
 
+### Tenant API keys
+
+**Why.** The pod's Claude credential is typically one person's subscription
+token (`claude setup-token`). Anthropic's terms do not allow a subscription
+credential to be shared by many people or used to serve other people's
+requests; a company's own API key, used by that company's authorised users, is
+allowed ([legal and compliance](https://code.claude.com/docs/en/legal-and-compliance)).
+A deployment that runs many companies' work on one subscription is exactly the
+first case. So each company's administrator stores the company's own Anthropic
+and OpenAI keys in the admin screen, and runs for that company use them.
+
+**What is read.** Before each run — work item or chat turn — the service calls
+`cli_agent_credential_get(p_tenant, p_provider)` with its service-role key
+(`SUPABASE_KEY`, the same client the rest of the service uses):
+`anthropic` for Claude Code, `openai` for Codex. The key itself lives in
+Supabase Vault; `cli_agent_credentials` holds only who set it, when, and the
+last four characters. The function is executable by `service_role` only.
+
+**Precedence, per run:**
+
+| Tenant key | Claude Code is started with | Codex is started with |
+| --- | --- | --- |
+| set | `ANTHROPIC_API_KEY=<key>`; the pod's `CLAUDE_CODE_OAUTH_TOKEN` and `ANTHROPIC_AUTH_TOKEN` are **removed** from that run's environment | `CODEX_API_KEY` and `OPENAI_API_KEY` = `<key>` |
+| not set, or unreadable | the pod's environment, unchanged | the pod's environment, unchanged |
+
+The pod's token is removed rather than left beside the key: with both present,
+which one is billed depends on the CLI's precedence rules (`ANTHROPIC_AUTH_TOKEN`
+outranks the key outright), and billing a company's work to the shared
+subscription is what this exists to stop. Nothing changes in `os.environ`: the
+key goes into the environment built for that one CLI process, so a concurrent
+run for another tenant cannot inherit it. The library's `exec_env` can only
+add to `os.environ`, never remove from it, so the run's provider is wrapped
+with an `exec_env` that drops those two variables after the merge.
+
+Without a key, the work item's timeline gets one line — 「회사 Anthropic API 키가
+설정되지 않아 이 서버의 기본 자격 증명으로 실행합니다」, or 「…확인하지 못해…」 when the
+lookup failed — and a chat turn logs it. A database without the function yet
+(production before the SQL is applied) counts as "not set" and is logged once
+per process.
+
+**Caching.** Answers, including "no key", are reused for
+`CLIAGENTS_CREDENTIAL_CACHE_SECONDS` (default 60) per tenant and provider, so a
+key saved or removed in the admin screen applies within a minute. A failed
+lookup is not cached; the next run asks again.
+
+**Never written down.** The key is not logged, not put in an event, the
+timeline, the journal or the session archive. The agent could still print it
+(an `env` in a shell): every CLI event is cleaned of it before anything reads
+the event, and after the CLI exits the run's workspace — the CLI's session
+transcript included — is scrubbed before it is archived, published or
+downloaded. `tests/test_credentials.py` runs a fake CLI that does exactly that
+and checks logs, chat events, timeline rows, workspace files and the archive.
+
 ### Platform
 
 | Variable | Needed for |
@@ -89,6 +145,7 @@ use `CLAUDE_CODE_OAUTH_TOKEN` or an API key there too.
 | `SUPABASE_JWT_SECRET` | optional — verifies HS256 user tokens locally. Without it, asymmetric tokens are checked against JWKS and HS256 ones by asking GoTrue (`/auth/v1/user`) |
 | `MEMENTO_BASE_URL` | download links for chat outputs (Memento's private `artifacts` bucket) |
 | `CLIAGENTS_PROCESS_POLLING` | `false` in runner Pods (default `true`) |
+| `CLIAGENTS_CREDENTIAL_CACHE_SECONDS` | how long a tenant's API key (or its absence) is reused, default `60` |
 
 ### Gateway
 
