@@ -221,7 +221,12 @@ class Journal:
             relative = path.resolve().relative_to(workspace_path.resolve())
         except (ValueError, OSError):
             return False
-        return relative.parts and relative.parts[0].startswith(".processgpt")
+        if not relative.parts:
+            return False
+        # A repository the run checked out (core.worktree) brings its whole
+        # object store along; that is git's record, not the run's work, and
+        # copying it into the snapshots would double the workspace.
+        return relative.parts[0].startswith(".processgpt") or ".git" in relative.parts
 
 
 def _relative(path: Path, workspace_path: Path) -> str:

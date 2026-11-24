@@ -30,16 +30,33 @@ from processgpt_agent_sdk import emit_chunk_json, is_chat_request
 from processgpt_agent_sdk.artifacts import strip_local_paths
 from typing_extensions import override
 
-from core import activity, bridge, chat_session, credentials, hitl, resume, skills, subagents
+from core import (
+    activity,
+    bridge,
+    chat_session,
+    credentials,
+    hitl,
+    resume,
+    skills,
+    subagents,
+    timeline,
+    worktree,
+)
 from core import events as ui_events
-from core import timeline
 from core import prompt as prompt_builder
 from core.availability import snapshot as cli_snapshot
 from core.journal import Journal
 from core.outcome import interpret
 from core.runner import ConcurrencyLimit, RunTimeoutError, astream
 from core.runtime import RuntimeLease
-from core.selection import CliNotChosenError, CliSelectionError, chat_choice, require_runnable, resolve
+from core.selection import (
+    CliNotChosenError,
+    CliSelectionError,
+    _flattened,
+    chat_choice,
+    require_runnable,
+    resolve,
+)
 from core.settings import settings
 from core.stream_registry import registry as stream_registry
 from core.workspace import Workspace, for_run
@@ -146,6 +163,17 @@ class CliAgentExecutor(AgentExecutor):
             # screen can act on (send the user to the admin, or retry).
             archive = False
             await self._chat_error(context, code=exc.code, text=exc.text, agent_id=exc.agent_id)
+        except worktree.WorktreeError as exc:
+            # The repository the work item named could not be checked out, or
+            # the finished branch could not be handed back. Running in an
+            # empty directory instead, or calling it done, would both be lies.
+            await self._fail(
+                event_queue,
+                task_id=task_id,
+                context_id=context_id,
+                text=f"작업 저장소를 준비하거나 결과 브랜치를 올리지 못했습니다: {exc}",
+            )
+            raise
         except RunTimeoutError as exc:
             await self._fail(
                 event_queue,
@@ -228,6 +256,23 @@ class CliAgentExecutor(AgentExecutor):
             provider=provider,
         )
 
+        # --- where the agent works -------------------------------------
+        # A work item that names a repository (``project_repo``) runs on a
+        # branch of it, checked out inside the workspace (core.worktree);
+        # instructions and tool wiring stay one level up so they never land in
+        # the commit. Never for a chat: whoever chats does not get to point the
+        # run at a path on this pod or at a server of their choosing.
+        tree = None
+        if not chat:
+            wt_settings = worktree.settings_from(
+                _flattened({"agent_config": declared.agent_config, **row, **extras})
+            )
+            if wt_settings:
+                tree = await asyncio.to_thread(
+                    worktree.prepare, wt_settings, workspace.path, workspace.run_id
+                )
+        workdir = tree.path if tree else workspace.path
+
         journal = Journal(workspace.path)
         journal.capture_baseline(workspace.path)
 
@@ -250,7 +295,7 @@ class CliAgentExecutor(AgentExecutor):
         # --- what the agent can read -----------------------------------
         bundle, skill_failures = skills.build_bundle(
             instructions=(
-                _instructions(row, extras, workspace, chat=chat)
+                _instructions(row, extras, workspace, chat=chat, tree=tree)
                 + "\n\n"
                 + subagents.delegation_instructions(runtime_agents)
             ),
@@ -308,7 +353,7 @@ class CliAgentExecutor(AgentExecutor):
                 row=row,
                 extras=extras,
                 workspace_exists=workspace.exists,
-                fresh_prompt=lambda: prompt_builder.build(row, extras, workdir=str(workspace.path)),
+                fresh_prompt=lambda: prompt_builder.build(row, extras, workdir=str(workdir)),
                 previous_summary=str(row.get("draft") or "")[:2000],
             )
         text = start.prompt
@@ -323,8 +368,11 @@ class CliAgentExecutor(AgentExecutor):
             )
 
         request = selection.to_request(
-            text, str(workspace.path), resume_session=resume_session
+            text, str(workdir), resume_session=resume_session
         )
+        if tree and selection.agent_id == "claude-code":
+            # the run's skills and instructions sit one level above the checkout
+            request.extra_args.extend(["--add-dir", str(workspace.path / ".claude")])
 
         # --- run --------------------------------------------------------
         if chat:
@@ -412,6 +460,23 @@ class CliAgentExecutor(AgentExecutor):
             )
             return
 
+        # The branch is the deliverable: committed by the service, not the
+        # agent, and — for a clone — pushed back before the run says it is done.
+        change = None
+        if tree:
+            change = await asyncio.to_thread(
+                tree.commit,
+                f"{row.get('activity_name') or 'cli-agent'} ({workspace.run_id[:12]})\n\n"
+                f"process instance: {row.get('proc_inst_id') or '-'}\n"
+                "proposed by ProcessGPT cli-agent; review before merging",
+            )
+            await self._note(
+                event_queue,
+                task_id=task_id,
+                context_id=context_id,
+                text=_change_line(tree, change),
+            )
+
         files: list[dict[str, Any]] = []
         if chat:
             published = await chat_session.publish(
@@ -444,6 +509,7 @@ class CliAgentExecutor(AgentExecutor):
             session_id=session_id,
             journal=journal,
             files=files,
+            change=change,
         )
 
     async def _stream(
@@ -618,8 +684,13 @@ class CliAgentExecutor(AgentExecutor):
         session_id: str | None,
         journal: Journal,
         files: list[dict[str, Any]] | None = None,
+        change: dict[str, Any] | None = None,
     ) -> None:
         payload = dict(outcome.payload)
+        if change:
+            # Where the proposal lives and what it touched. Process GPT Lite
+            # reads ``output.worktree.branch`` to offer the branch for review.
+            payload["worktree"] = change
         if session_id:
             # Persisted so the next turn, or a human's answer tomorrow, can
             # resume this conversation instead of starting a new one.
@@ -669,7 +740,9 @@ class CliAgentExecutor(AgentExecutor):
         # platform decides output-vs-draft from the item's own `agent_mode`;
         # sending False here only tells it the run is still going, so a draft
         # run stays IN_PROGRESS forever with a finished answer sitting in it.
-        text = body if outcome.outputs else outcome.raw_text
+        # With a branch the stored output has to be the JSON body: prose alone
+        # would leave ``output.worktree`` out of the work item.
+        text = body if (outcome.outputs or change) else outcome.raw_text
         metadata: dict[str, Any] = {"role": "assistant"}
         if files:
             # `pdfFiles` is the SDK's name for a turn's downloads: it rides on
@@ -906,7 +979,12 @@ class CliAgentExecutor(AgentExecutor):
 
 
 def _instructions(
-    row: dict[str, Any], extras: dict[str, Any], workspace: Workspace, *, chat: bool = False
+    row: dict[str, Any],
+    extras: dict[str, Any],
+    workspace: Workspace,
+    *,
+    chat: bool = False,
+    tree: worktree.Worktree | None = None,
 ) -> str:
     """The always-on project instruction file for this run."""
     lines = [
@@ -922,6 +1000,12 @@ def _instructions(
         "- 확실하지 않은 값을 지어내지 말고, 모르면 모른다고 결과에 적으세요.",
         "- 연결된 MCP 도구가 있으면 추측 대신 도구로 확인하세요.",
     ]
+    if tree:
+        lines += [
+            f"- 작업 디렉터리는 저장소 `{tree.name}` 의 체크아웃이다(브랜치 `{tree.branch}`, 기준 `{tree.base}`).",
+            "- 기존 파일의 구조·이름·관례를 먼저 읽고 그대로 따른다. 필요한 만큼만 고친다.",
+            "- git 명령(commit·push·브랜치 전환)은 하지 않는다. 커밋과 올리기는 서비스가 하고, 병합은 사람이 검토 후에 한다.",
+        ]
     activity = (row.get("activity_name") or "").strip()
     if activity:
         lines += ["", f"현재 업무: {activity}"]
@@ -947,6 +1031,16 @@ def _instructions(
     # service holds. Said once here rather than repeated in every skill.
     lines += ["", prompt_builder.artifact_paths(str(workspace.path), workspace.run_id)]
     return "\n".join(lines)
+
+
+def _change_line(tree: worktree.Worktree, change: dict[str, Any]) -> str:
+    """One line for the run's record: what happened to the branch."""
+    if not change.get("commit") and not change.get("pushed"):
+        return f"{tree.name} 에 바뀐 파일이 없어 커밋하지 않았습니다."
+    where = f"{tree.name} 의 {change['branch']} 브랜치"
+    done = "에 커밋하고 올렸습니다" if change.get("pushed") else "에 커밋했습니다"
+    detail = ", ".join(x for x in (change.get("commit") or "", change.get("stat") or "") if x)
+    return f"{where}{done}" + (f" ({detail})." if detail else ".")
 
 
 def _named_skills(row: dict[str, Any], extras: dict[str, Any]) -> list[str]:

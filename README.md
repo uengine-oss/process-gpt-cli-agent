@@ -253,6 +253,32 @@ long both stay possible; the service sweeps hourly.
 A runner Pod's `/workspace` can be an `emptyDir`: for chat the session archive
 is the original and the disk a cache.
 
+### Working on a repository (`project_repo`)
+
+A work item whose `agent_config` names `project_repo` runs on a branch of that
+repository instead of an empty directory (`core/worktree.py`). The branch is
+`pgpt-agent/<first 12 characters of the run id>`, started from `base_ref`
+(`main`, `origin/main`, any branch of the repository, or a commit). The agent
+edits; the service commits when the run finishes, and the result's
+`output.worktree` says where (`branch`, `base`, `commit`, `files`, `stat`, and
+for a URL `remote` and `pushed`). Chat turns never get one.
+
+| `project_repo` | What the run gets |
+| --- | --- |
+| a path on this pod's disk | a `git worktree` of it. Only when the repository shares this pod's disk (local development). |
+| `http(s)://…` (or `file://…`) | its own clone in the run's workspace. The branch is pushed back after the commit; a push that fails fails the run with git's reason. |
+
+For a URL, `project_repo_token` (`projectRepoToken`) is sent as
+`Authorization: Bearer …` on every fetch and push, given to git as
+command-level configuration through the environment — never written into the
+clone's `.git/config`, never on a command line. Process GPT Lite hands a shared
+folder over this way (`PRO_GIT_URL` there): the folder's repository is on
+Lite's volume and Lite serves it over git smart HTTP, accepting pushes only to
+`refs/heads/pgpt-agent/*`. If the remote already has the run's branch (an
+earlier attempt), the run continues it; a paused run resumes into its own clone
+without contacting the server. The hourly sweep removes the clone with the rest
+of the run directory.
+
 ### Rolling back
 
 Nothing else depends on this service, so a rollback is:
